@@ -45,14 +45,6 @@
   --radius-4xl: 8px;
 }
 
-@utility page-x {
-  padding-inline: --spacing(4);
-
-  @variant md {
-    padding-inline: max(--spacing(8), calc((100cqw - var(--container-6xl)) / 2 + --spacing(8)));
-  }
-}
-
 :root {
   color-scheme: dark;
   --font-cjk: 'Microsoft YaHei UI', 'PingFang SC', 'Noto Sans SC';
@@ -74,7 +66,6 @@
 
 :root:lang(ko) {
   --font-cjk: 'Malgun Gothic', 'Apple SD Gothic Neo', 'Noto Sans KR';
-  word-break: keep-all;
 }
 
 :root[data-theme='light'] {
@@ -162,7 +153,7 @@ textarea:disabled {
 code,
 pre,
 .font-mono {
-  font-family: 'JetBrains Mono', Consolas, Menlo, var(--font-cjk), monospace;
+  font-family: 'JetBrains Mono', Consolas, monospace;
 }
 
 ::-webkit-scrollbar {
@@ -388,7 +379,7 @@ button[aria-busy='true']:has(> svg)::before {
   }
 }
 
-.markdown > :where(:not(:first-child)) {
+.markdown > * + * {
   margin-top: 0.75rem;
 }
 
@@ -484,11 +475,4 @@ button[aria-busy='true']:has(> svg)::before {
 
 .markdown hr {
   border-color: var(--color-line);
-}
-
-/* append-list 是可追加行的列表：约 5 行后在列表内滚动 */
-.append-list {
-  max-height: 14rem;
-  overflow-y: auto;
-  scrollbar-width: thin;
 }

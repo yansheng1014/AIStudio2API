@@ -34,7 +34,7 @@ const { startConsole, stopConsole } = useConsole()
 watch(
   () => session.value?.authenticated,
   (authenticated) => {
-    if (authenticated) startConsole()
+    if (authenticated) void startConsole()
     else stopConsole()
   },
 )

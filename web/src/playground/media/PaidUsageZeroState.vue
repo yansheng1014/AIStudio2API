@@ -4,16 +4,20 @@ import { useI18n } from '@/i18n'
 import type { IconName } from '@/playground/ui/icons'
 import UiIcon from '@/playground/ui/UiIcon.vue'
 
-// Suggestion 是空态中的一张示例卡片：image 为卡片图
+// Suggestion 是空态中的一张示例卡片：image 为卡片图，reference 为叠在左下角的参考图，caption 为卡片下方文字
 export interface Suggestion {
   image: string
   label: string
   prompt: string
+  caption?: string
+  reference?: string
 }
 
-// 示例卡片与官网 ms-suggestion-gallery 的 mosaic 布局一致：两列拼贴，600 px 以下为单行横向滚动
+// layout 与官网 ms-suggestion-gallery 一致：mosaic 为两列拼贴，single-row 为单行横向滚动；600 px 以下都为单行
 defineProps<{
   title: string
+  subtitle?: string
+  layout: 'mosaic' | 'single-row'
   icon: IconName
   suggestions: readonly Suggestion[]
 }>()
@@ -42,14 +46,15 @@ onUnmounted(() => observer.disconnect())
 </script>
 
 <template>
-  <div class="zero-state-content">
+  <div class="zero-state-content" :data-layout="layout">
     <div class="paid-usage-zero-state">
       <div class="left-container">
         <div class="title-content-container">
           <h1 class="hero-text">{{ title }}</h1>
+          <span v-if="subtitle" class="subtitle-container">{{ subtitle }}</span>
         </div>
       </div>
-      <div class="suggestion-gallery-host">
+      <div class="suggestion-gallery-host" :data-layout="layout">
         <div ref="gallery" class="suggestion-gallery" @scroll="updateScroll">
           <button
             v-for="item in suggestions"
@@ -63,7 +68,9 @@ onUnmounted(() => observer.disconnect())
             <span class="display-media-container">
               <img class="display-media" :src="item.image" alt="" @load="updateScroll" />
               <span class="media-type-icon"><UiIcon :name="icon" :size="18" /></span>
+              <img v-if="item.reference" class="reference-image" :src="item.reference" alt="" />
             </span>
+            <span v-if="item.caption" class="content-text">{{ item.caption }}</span>
           </button>
         </div>
         <div class="gallery-overlay">
@@ -151,6 +158,13 @@ onUnmounted(() => observer.disconnect())
   color: #fcfcfc;
 }
 
+.title-content-container > .subtitle-container {
+  max-width: 68ch;
+  margin: 0;
+  font-size: 14px;
+  line-height: 21px;
+}
+
 .suggestion-gallery-host {
   position: relative;
   width: 100%;
@@ -164,9 +178,7 @@ onUnmounted(() => observer.disconnect())
 .suggestion-card {
   position: relative;
   display: flex;
-  grid-column: span 3;
   flex-direction: column;
-  align-self: start;
   align-items: flex-start;
   margin: 8px;
   padding: 0;
@@ -208,25 +220,51 @@ onUnmounted(() => observer.disconnect())
   color: var(--color-on-surface);
 }
 
-.suggestion-gallery {
+.reference-image {
+  position: absolute;
+  bottom: 8px;
+  left: 8px;
+  width: 48px;
+  height: 48px;
+  border-radius: 8px;
+  box-shadow:
+    0 1px 3px 1px rgb(0 0 0 / 15%),
+    0 1px 2px 0 rgb(0 0 0 / 30%);
+  object-fit: cover;
+}
+
+.content-text {
+  width: 100%;
+  margin: 8px 0 12px 8px;
+  color: var(--color-on-surface-variant);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+[data-layout='mosaic'] .suggestion-gallery {
   display: grid;
   grid-template-columns: repeat(6, 1fr);
   gap: 8px;
   width: 100%;
 }
 
-.suggestion-card:nth-child(1),
-.suggestion-card:nth-child(3) {
+[data-layout='mosaic'] .suggestion-card {
+  grid-column: span 3;
+  align-self: start;
+}
+
+[data-layout='mosaic'] .suggestion-card:nth-child(1),
+[data-layout='mosaic'] .suggestion-card:nth-child(3) {
   justify-self: end;
 }
 
-.suggestion-card:nth-child(1),
-.suggestion-card:nth-child(2) {
+[data-layout='mosaic'] .suggestion-card:nth-child(1),
+[data-layout='mosaic'] .suggestion-card:nth-child(2) {
   align-self: end;
 }
 
-.suggestion-card:nth-child(2),
-.suggestion-card:nth-child(4) {
+[data-layout='mosaic'] .suggestion-card:nth-child(2),
+[data-layout='mosaic'] .suggestion-card:nth-child(4) {
   justify-self: start;
 }
 
@@ -253,10 +291,42 @@ onUnmounted(() => observer.disconnect())
   right: 0;
 }
 
+[data-layout='single-row'] .gallery-overlay {
+  position: absolute;
+  top: 0;
+  display: flex;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+[data-layout='single-row'] .suggestion-gallery {
+  display: flex;
+  gap: 8px;
+  margin-top: -4px;
+  padding-top: 4px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+[data-layout='single-row'] .suggestion-card {
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  width: 304px;
+  height: 240px;
+  margin: 0;
+  padding: 8px;
+  border-radius: 12px;
+}
+
 @media screen and (max-width: 600px) {
   .zero-state-content {
     justify-content: flex-start;
-    padding: 16px 16px 0;
+    padding: 16px 0 0;
+  }
+
+  .zero-state-content[data-layout='mosaic'] {
+    padding-inline: 16px;
   }
 
   .paid-usage-zero-state {
@@ -274,7 +344,7 @@ onUnmounted(() => observer.disconnect())
     pointer-events: none;
   }
 
-  .suggestion-gallery {
+  [data-layout='mosaic'] .suggestion-gallery {
     display: flex;
     overflow-x: auto;
     scrollbar-width: none;

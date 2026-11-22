@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/json/jsontext"
 	"errors"
@@ -326,7 +327,7 @@ func (s *server) handleGeminiModels(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	models = s.searchModels(models)
+	models = s.uncutModels(s.searchModels(models))
 	page, next, err := geminiPage(r.URL.Query(), models, 50, 1000)
 	if err != nil {
 		writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
@@ -383,7 +384,7 @@ func (s *server) handleGeminiModel(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if model, ok := LookupPublicModel(s.searchModels(models), modelID); ok {
+	if model, ok := LookupPublicModel(s.uncutModels(s.searchModels(models)), modelID); ok {
 		writeJSON(w, http.StatusOK, officialOrder("gemini", geminiModelObject(model)))
 		return
 	}
@@ -391,7 +392,7 @@ func (s *server) handleGeminiModel(w http.ResponseWriter, r *http.Request) {
 }
 
 // geminiServedMethods 是本服务以 Gemini API 形式提供的模型方法
-var geminiServedMethods = []string{"generateContent", "countTokens", "createCachedContent", "embedContent", "batchEmbedContents", "predict", "predictLongRunning", "createDecision"}
+var geminiServedMethods = []string{"generateContent", "countTokens", "createCachedContent", "embedContent", "batchEmbedContents", "predict", "predictLongRunning"}
 
 func geminiModelObject(model aistudio.Model) map[string]any {
 	methods := make([]string, 0, len(model.Methods))
@@ -523,7 +524,7 @@ func (s *server) handleGeminiAction(w http.ResponseWriter, r *http.Request) {
 func decodeGeminiJSON(r *http.Request, target any) error {
 	body, err := io.ReadAll(r.Body)
 	if err == nil {
-		body, err = geminiCamelKeys(body)
+		body, _, err = geminiCamelKeys(body)
 	}
 	if err == nil {
 		err = json.Unmarshal(body, target)
@@ -544,114 +545,62 @@ var geminiOpaqueFields = map[string]bool{
 }
 
 // geminiCamelKeys 按 proto3 JSON 规则把各层消息字段名转为 lowerCamelCase，同层两种写法并存时保留驼峰字段，自由 JSON 字段的取值原样保留
-func geminiCamelKeys(raw []byte) ([]byte, error) {
+func geminiCamelKeys(raw []byte) ([]byte, bool, error) {
 	value := bytes.TrimSpace(raw)
 	if len(value) == 0 || value[0] != '{' && value[0] != '[' {
-		return raw, nil
+		return raw, false, nil
 	}
 	if camel, err := geminiKeysCamel(value); err == nil && camel {
-		return raw, nil
+		return raw, false, nil
 	}
-	decoder := jsontext.NewDecoder(bytes.NewBuffer(value), jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true))
-	output, err := writeGeminiCamelKeys(make([]byte, 0, len(value)), decoder, false)
-	if _, end := decoder.ReadToken(); err != nil || end != io.EOF {
-		return nil, cmp.Or(geminiSyntaxError(value), err)
-	}
-	return output, nil
-}
-
-// geminiSyntaxError 按根值的成员名与各成员值逐个读取 value，返回其中的语法错误或根值之后的多余内容，都没有时返回 nil
-func geminiSyntaxError(value []byte) error {
-	decoder := jsontext.NewDecoder(bytes.NewBuffer(value), jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true))
-	open, err := decoder.ReadToken()
-	closing := jsontext.Kind(']')
-	if open.Kind() == '{' {
-		closing = '}'
-	}
-	for err == nil && decoder.PeekKind() != closing {
-		if open.Kind() == '{' {
-			_, err = decoder.ReadToken()
+	changed := false
+	if value[0] == '[' {
+		var items []json.RawMessage
+		if err := json.Unmarshal(value, &items); err != nil {
+			return nil, false, err
 		}
-		if err == nil {
-			_, err = decoder.ReadValue()
-		}
-	}
-	if err == nil {
-		_, err = decoder.ReadToken()
-	}
-	if err == nil {
-		if _, end := decoder.ReadToken(); end != io.EOF {
-			err = cmp.Or(end, errors.New("unexpected data after top-level value"))
-		}
-	}
-	return err
-}
-
-// writeGeminiCamelKeys 从 decoder 读出下一个 JSON 值追加到 output：对象与数组中各层消息字段名转为 lowerCamelCase，同层两种写法并存时去掉改名得到的字段；opaque 为真的值与其余值按原字节写出
-func writeGeminiCamelKeys(output []byte, decoder *jsontext.Decoder, opaque bool) ([]byte, error) {
-	kind := decoder.PeekKind()
-	if opaque || kind != '{' && kind != '[' {
-		value, err := decoder.ReadValue()
-		return append(output, value...), err
-	}
-	if _, err := decoder.ReadToken(); err != nil {
-		return output, err
-	}
-	if kind == '[' {
-		output = append(output, '[')
-		for index := 0; decoder.PeekKind() != ']'; index++ {
-			if index > 0 {
-				output = append(output, ',')
+		for index, item := range items {
+			converted, itemChanged, err := geminiCamelKeys(item)
+			if err != nil {
+				return nil, false, err
 			}
-			var err error
-			if output, err = writeGeminiCamelKeys(output, decoder, false); err != nil {
-				return output, err
-			}
+			items[index], changed = converted, changed || itemChanged
 		}
-		_, err := decoder.ReadToken()
-		return append(output, ']'), err
-	}
-	// member 是已写出的字段：name 为转换后的字段名，renamed 表示原名不同，start 与 end 为它在 output 中连同前导逗号的位置
-	type member struct {
-		name       string
-		renamed    bool
-		start, end int
-	}
-	var buffer [8]member
-	members := buffer[:0]
-	open := len(output)
-	output = append(output, '{')
-	for decoder.PeekKind() != '}' {
-		token, err := decoder.ReadToken()
-		if err != nil {
-			return output, err
+		if !changed {
+			return raw, false, nil
 		}
-		key := token.String()
+		encoded, err := json.Marshal(items)
+		return encoded, true, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(value, &fields); err != nil {
+		return nil, false, err
+	}
+	converted := make(map[string]json.RawMessage, len(fields))
+	for key, field := range fields {
 		name := geminiJSONName(key)
-		start := len(output)
-		if len(members) > 0 {
-			output = append(output, ',')
+		if name != key {
+			changed = true
+			if _, exists := fields[name]; exists {
+				continue
+			}
 		}
-		if output, err = jsontext.AppendQuote(output, name); err != nil {
-			return output, err
+		if !geminiOpaqueFields[name] {
+			var fieldChanged bool
+			var err error
+			field, fieldChanged, err = geminiCamelKeys(field)
+			if err != nil {
+				return nil, false, err
+			}
+			changed = changed || fieldChanged
 		}
-		if output, err = writeGeminiCamelKeys(append(output, ':'), decoder, geminiOpaqueFields[name]); err != nil {
-			return output, err
-		}
-		members = append(members, member{name: name, renamed: name != key, start: start, end: len(output)})
+		converted[name] = field
 	}
-	if _, err := decoder.ReadToken(); err != nil {
-		return output, err
+	if !changed {
+		return raw, false, nil
 	}
-	for index := len(members) - 1; index >= 0; index-- {
-		if field := members[index]; field.renamed && slices.ContainsFunc(members, func(other member) bool { return !other.renamed && other.name == field.name }) {
-			output = slices.Delete(output, field.start, field.end)
-		}
-	}
-	if len(output) > open+1 && output[open+1] == ',' {
-		output = slices.Delete(output, open+1, open+2)
-	}
-	return append(output, '}'), nil
+	encoded, err := json.Marshal(converted)
+	return encoded, true, err
 }
 
 // geminiKeysCamel 逐个读取 JSON token，判断各层消息字段名是否都已是 lowerCamelCase，不读取自由 JSON 字段的取值
@@ -824,7 +773,6 @@ func (request geminiRequest) toGenerateRequest(id string, model string) (aistudi
 	return aistudio.GenerateRequest{
 		ID: id, Model: model, System: system, Contents: contents, Config: config, Tools: tools,
 		SafetySettings: safety, ServiceTier: request.ServiceTier, Store: request.Store, Labels: request.Labels,
-		KeepAbnormalFinish: true,
 	}, nil
 }
 
@@ -1052,7 +1000,7 @@ func mapGeminiParts(input []geminiPart) ([]aistudio.Part, bool, error) {
 			}
 			mimeType, data := normalizeImagePayload(attachmentMIME(mime, inline.DisplayName, data), data)
 			parts = append(parts, aistudio.Part{
-				InlineData:       aistudio.NewBlob(mimeType, data),
+				InlineData:       &aistudio.Blob{MIME: mimeType, Data: data},
 				ThoughtSignature: part.ThoughtSignature,
 				VideoMetadata:    video, MediaProcessing: processing, DisplayName: inline.DisplayName, MediaResolution: resolution,
 			})
@@ -1093,6 +1041,9 @@ func mapGeminiParts(input []geminiPart) ([]aistudio.Part, bool, error) {
 				ThoughtSignature: part.ThoughtSignature,
 			})
 		case part.FunctionResponse != nil:
+			if part.FunctionResponse.Name == "" {
+				return nil, false, fmt.Errorf("functionResponse requires name")
+			}
 			response, err := geminiJSONObject(part.FunctionResponse.Response, "functionResponse.response")
 			if err != nil {
 				return nil, false, err
@@ -1134,7 +1085,8 @@ func geminiJSONObject(raw json.RawMessage, field string) (json.RawMessage, error
 	if len(raw) == 0 {
 		return json.RawMessage(`{}`), nil
 	}
-	if value := bytes.TrimSpace(raw); len(value) == 0 || value[0] != '{' {
+	var object map[string]any
+	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
 		return nil, fmt.Errorf("%s must be an object", field)
 	}
 	return raw, nil
@@ -1379,7 +1331,7 @@ func (s *server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request, re
 	writeJSON(w, http.StatusOK, officialOrder("gemini", buildGeminiResponse(request, output.cache, results)))
 }
 
-// writeGeminiFailure 写出响应头之前的生成失败，上游按输入拦截时按 Gemini API 返回 200 与 promptFeedback
+// writeGeminiFailure 写出响应头之前的生成失败，上游拒绝输入时按 Gemini API 返回 200 与 promptFeedback
 func writeGeminiFailure(w http.ResponseWriter, r *http.Request, request aistudio.GenerateRequest, err error, stream bool) {
 	if !shouldWriteRequestError(r, err) {
 		return
@@ -1398,24 +1350,24 @@ func writeGeminiFailure(w http.ResponseWriter, r *http.Request, request aistudio
 	}
 }
 
-// geminiPromptFeedback 把上游输入拦截投影为不含候选的 Gemini 响应，用量为拦截帧中上游计入的输入
+// geminiPromptFeedback 把上游输入拒绝投影为不含候选的 Gemini 响应
 func geminiPromptFeedback(request aistudio.GenerateRequest, err error) (map[string]any, bool) {
 	var feedback *aistudio.PromptFeedbackError
 	if !errors.As(err, &feedback) {
 		return nil, false
 	}
-	block := map[string]any{"blockReason": strings.ToUpper(feedback.Reason)}
+	reason := strings.ToUpper(strings.TrimSpace(feedback.Reason))
+	if reason == "" || reason == "UNSPECIFIED" {
+		reason = "BLOCK_REASON_UNSPECIFIED"
+	}
+	block := map[string]any{"blockReason": reason}
 	if feedback.Message != "" {
 		block["blockReasonMessage"] = feedback.Message
 	}
 	if len(feedback.SafetyRatings) > 0 {
 		block["safetyRatings"] = feedback.SafetyRatings
 	}
-	response := map[string]any{"promptFeedback": block, "modelVersion": request.Model, "responseId": request.ID}
-	if feedback.Usage != nil {
-		response["usageMetadata"] = geminiUsage(feedback.Usage)
-	}
-	return response, true
+	return map[string]any{"promptFeedback": block, "modelVersion": request.Model, "responseId": request.ID}, true
 }
 
 // buildGeminiResponse 按候选序号输出各候选内容与终止原因，用量为全部候选之和，cache 非空时计入缓存部分
@@ -1478,7 +1430,9 @@ func geminiOutputPart(part aistudio.Part) map[string]any {
 	case part.CodeExecutionResult != nil:
 		value = map[string]any{"codeExecutionResult": part.CodeExecutionResult}
 	case part.InlineData != nil:
-		value = map[string]any{"inlineData": map[string]any{"mimeType": part.InlineData.MIME, "data": part.InlineData.Data}}
+		value = map[string]any{"inlineData": map[string]any{
+			"mimeType": part.InlineData.MIME, "data": base64.StdEncoding.EncodeToString(part.InlineData.Data),
+		}}
 	case part.ExternalMedia != nil:
 		value = map[string]any{"fileData": map[string]any{"mimeType": part.ExternalMedia.MIME, "fileUri": part.ExternalMedia.URL}}
 	default:
@@ -1671,20 +1625,36 @@ func geminiFinishReason(reason string) string {
 		return "FINISH_REASON_UNSPECIFIED"
 	case "max_tokens":
 		return "MAX_TOKENS"
+	case "safety":
+		return "SAFETY"
+	case "recitation":
+		return "RECITATION"
 	case "language":
 		return "LANGUAGE"
 	case "other":
 		return "OTHER"
+	case "blocklist":
+		return "BLOCKLIST"
+	case "prohibited_content":
+		return "PROHIBITED_CONTENT"
+	case "spii":
+		return "SPII"
 	case "malformed_function_call":
 		return "MALFORMED_FUNCTION_CALL"
+	case "image_safety":
+		return "IMAGE_SAFETY"
 	case "unexpected_tool_call":
 		return "UNEXPECTED_TOOL_CALL"
 	case "too_many_tool_calls":
 		return "TOO_MANY_TOOL_CALLS"
+	case "image_prohibited_content":
+		return "IMAGE_PROHIBITED_CONTENT"
 	case "image_other":
 		return "IMAGE_OTHER"
 	case "no_image":
 		return "NO_IMAGE"
+	case "image_recitation":
+		return "IMAGE_RECITATION"
 	case "missing_thought_signature":
 		return "MISSING_THOUGHT_SIGNATURE"
 	case "malformed_response":
@@ -1739,43 +1709,47 @@ func setGeminiFinish(candidate map[string]any, reason, message string) {
 	}
 }
 
-// geminiUsageMetadata 是 Gemini API 的 usageMetadata，字段按官方顺序，值为 0 的计数与上游没有的字段省略
-type geminiUsageMetadata struct {
-	PromptTokenCount                       int64                         `json:"promptTokenCount,omitempty"`
-	CandidatesTokenCount                   int64                         `json:"candidatesTokenCount,omitempty"`
-	TotalTokenCount                        int64                         `json:"totalTokenCount,omitempty"`
-	CachedContentTokenCount                int64                         `json:"cachedContentTokenCount,omitempty"`
-	PromptTokensDetails                    []aistudio.ModalityTokenCount `json:"promptTokensDetails,omitempty"`
-	CacheTokensDetails                     []aistudio.ModalityTokenCount `json:"cacheTokensDetails,omitempty"`
-	CandidatesTokensDetails                []aistudio.ModalityTokenCount `json:"candidatesTokensDetails,omitempty"`
-	ToolUsePromptTokenCount                int64                         `json:"toolUsePromptTokenCount,omitempty"`
-	ToolUsePromptTokensDetails             []aistudio.ModalityTokenCount `json:"toolUsePromptTokensDetails,omitempty"`
-	ThoughtsTokenCount                     int64                         `json:"thoughtsTokenCount,omitempty"`
-	BilledToolCalls                        json.RawMessage               `json:"billedToolCalls,omitempty"`
-	ToolCallStats                          json.RawMessage               `json:"toolCallStats,omitempty"`
-	ServiceTier                            string                        `json:"serviceTier,omitempty"`
-	ModelInvocationTokenCounts             json.RawMessage               `json:"modelInvocationTokenCounts,omitempty"`
-	RawPromptTokenCount                    int64                         `json:"rawPromptTokenCount,omitempty"`
-	NonGroundingModelInvocationTokenCounts json.RawMessage               `json:"nonGroundingModelInvocationTokenCounts,omitempty"`
-}
-
-// geminiUsage 按 Gemini API usageMetadata 输出用量
-func geminiUsage(usage *aistudio.Usage) geminiUsageMetadata {
-	metadata := geminiUsageMetadata{
-		PromptTokenCount: usage.InputTokens, CandidatesTokenCount: usage.OutputTokens, TotalTokenCount: usage.TotalTokens,
-		CachedContentTokenCount: usage.CachedTokens, ToolUsePromptTokenCount: usage.ToolTokens, ThoughtsTokenCount: usage.ReasoningTokens,
+// geminiUsage 按 Gemini API usageMetadata 输出用量：值为 0 的计数与上游没有的字段省略
+func geminiUsage(usage *aistudio.Usage) map[string]any {
+	metadata := map[string]any{}
+	for name, value := range map[string]int64{
+		"promptTokenCount": usage.InputTokens, "candidatesTokenCount": usage.OutputTokens, "totalTokenCount": usage.TotalTokens,
+		"cachedContentTokenCount": usage.CachedTokens, "toolUsePromptTokenCount": usage.ToolTokens, "thoughtsTokenCount": usage.ReasoningTokens,
+	} {
+		if value != 0 {
+			metadata[name] = value
+		}
 	}
-	if details := usage.Details; details != nil {
-		metadata.PromptTokensDetails, metadata.CacheTokensDetails = details.PromptTokensDetails, details.CacheTokensDetails
-		metadata.CandidatesTokensDetails, metadata.ToolUsePromptTokensDetails = details.CandidatesTokensDetails, details.ToolUsePromptTokensDetails
-		metadata.BilledToolCalls, metadata.ToolCallStats, metadata.ServiceTier = details.BilledToolCalls, details.ToolCallStats, details.ServiceTier
-		metadata.ModelInvocationTokenCounts, metadata.RawPromptTokenCount = details.ModelInvocationTokenCounts, details.RawPromptTokenCount
-		metadata.NonGroundingModelInvocationTokenCounts = details.NonGroundingModelInvocationTokenCounts
+	details := usage.Details
+	if details == nil {
+		return metadata
+	}
+	for name, value := range map[string]json.RawMessage{
+		"billedToolCalls": details.BilledToolCalls, "toolCallStats": details.ToolCallStats, "modelInvocationTokenCounts": details.ModelInvocationTokenCounts,
+		"nonGroundingModelInvocationTokenCounts": details.NonGroundingModelInvocationTokenCounts,
+	} {
+		if len(value) > 0 {
+			metadata[name] = value
+		}
+	}
+	if details.RawPromptTokenCount != 0 {
+		metadata["rawPromptTokenCount"] = details.RawPromptTokenCount
+	}
+	for name, value := range map[string][]aistudio.ModalityTokenCount{
+		"promptTokensDetails": details.PromptTokensDetails, "cacheTokensDetails": details.CacheTokensDetails,
+		"candidatesTokensDetails": details.CandidatesTokensDetails, "toolUsePromptTokensDetails": details.ToolUsePromptTokensDetails,
+	} {
+		if len(value) > 0 {
+			metadata[name] = value
+		}
+	}
+	if details.ServiceTier != "" {
+		metadata["serviceTier"] = details.ServiceTier
 	}
 	return metadata
 }
 
-// geminiStream 写出 streamGenerateContent 的响应块：alt=sse 时为静默时写出空帧心跳的 SSE，否则与官方 REST 一样为逐个对象写出的 JSON 数组
+// geminiStream 写出 streamGenerateContent 的响应块：alt=sse 时为静默时写出空行心跳的 SSE，否则与官方 REST 一样为逐个对象写出的 JSON 数组
 type geminiStream struct {
 	w         http.ResponseWriter
 	keepalive *streamKeepalive
@@ -1798,38 +1772,14 @@ func openGeminiStream(w http.ResponseWriter, r *http.Request) (*geminiStream, er
 
 // write 写出一个响应块
 func (stream *geminiStream) write(value map[string]any) error {
-	data, err := json.Marshal(officialOrder("gemini", value))
-	if err != nil {
-		return err
-	}
-	return stream.writeJSON(data)
-}
-
-// geminiTextChunk 返回只含一段正文的流式响应块，usage 与 turnToken 为空时省略，字节与按官方字段顺序编码的同一对象相同
-func geminiTextChunk(index int, text, model, responseID, turnToken string, usage *aistudio.Usage) ([]byte, error) {
-	chunk := appendJSONString(append(make([]byte, 0, 256+len(text)), `{"candidates":[{"content":{"parts":[{"text":`...), text)
-	chunk = append(strconv.AppendInt(append(chunk, `}],"role":"model"},"index":`...), int64(index), 10), "}]"...)
-	if usage != nil {
-		metadata, err := json.Marshal(geminiUsage(usage))
-		if err != nil {
-			return nil, err
-		}
-		chunk = append(append(chunk, `,"usageMetadata":`...), metadata...)
-	}
-	chunk = appendJSONString(append(chunk, `,"modelVersion":`...), model)
-	chunk = appendJSONString(append(chunk, `,"responseId":`...), responseID)
-	if turnToken != "" {
-		chunk = appendJSONString(append(chunk, `,"turnToken":`...), turnToken)
-	}
-	return append(chunk, '}'), nil
-}
-
-// writeJSON 写出一个已编码的响应块
-func (stream *geminiStream) writeJSON(data []byte) error {
 	stream.mu.Lock()
 	defer stream.mu.Unlock()
 	if stream.keepalive != nil {
-		return writeSSEFrame(stream.w, append(append(sseFrameStart("", len(data)), data...), "\n\n"...))
+		return writeSSE(stream.w, "", officialOrder("gemini", value))
+	}
+	data, err := json.Marshal(officialOrder("gemini", value))
+	if err != nil {
+		return err
 	}
 	prefix := "["
 	if stream.written {
@@ -1837,23 +1787,6 @@ func (stream *geminiStream) writeJSON(data []byte) error {
 	}
 	stream.written = true
 	if _, err := io.WriteString(stream.w, prefix+string(data)); err != nil {
-		return err
-	}
-	return http.NewResponseController(stream.w).Flush()
-}
-
-// fail 写出流内错误：SSE 按官方 SDK 的解析方式写成不带 data: 前缀的整块 JSON，JSON 数组中写为一个元素
-func (stream *geminiStream) fail(value map[string]any) error {
-	if stream.keepalive == nil {
-		return stream.write(value)
-	}
-	data, err := json.Marshal(officialOrder("gemini", value))
-	if err != nil {
-		return err
-	}
-	stream.mu.Lock()
-	defer stream.mu.Unlock()
-	if _, err := stream.w.Write(append(data, '\n')); err != nil {
 		return err
 	}
 	return http.NewResponseController(stream.w).Flush()
@@ -1897,29 +1830,18 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 				finalParts[index] = append(finalParts[index], part)
 				return nil
 			}
-			var usage *aistudio.Usage
-			if event.FrameUsage != nil {
-				usage = output.cache.usage(event.FrameUsage)
-			}
-			if text, ok := part["text"].(string); ok && len(part) == 1 {
-				chunk, err := geminiTextChunk(index, text, cmp.Or(event.ProviderModel, request.Model), cmp.Or(event.ResponseID, request.ID), event.TurnToken, usage)
-				if err != nil {
-					return err
-				}
-				return stream.writeJSON(chunk)
-			}
 			candidate := map[string]any{"index": index, "content": map[string]any{"role": "model", "parts": []any{part}}}
 			frame := map[string]any{"responseId": cmp.Or(event.ResponseID, request.ID), "modelVersion": cmp.Or(event.ProviderModel, request.Model), "candidates": []any{candidate}}
 			if event.TurnToken != "" {
 				frame["turnToken"] = event.TurnToken
 			}
-			if usage != nil {
-				frame["usageMetadata"] = geminiUsage(usage)
+			if event.FrameUsage != nil {
+				frame["usageMetadata"] = geminiUsage(output.cache.usage(event.FrameUsage))
 			}
 			return write(frame)
 		}
 		buffered := false
-		result, err := collectStreamEvents(candidates.ctx, events, func(event aistudio.Event) error {
+		result, err := consumeStreamEvents(candidates.ctx, events, func(event aistudio.Event) error {
 			if audio := output.audio; audio != nil && audioEvent(event) {
 				if output.delivery.audio || !audio.streams(*event.InlineData) {
 					buffered = true
@@ -1932,7 +1854,7 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 				event.InlineData = &converted
 			}
 			return send(event)
-		}, output.audio == nil)
+		})
 		if err != nil || !buffered {
 			return result, err
 		}
@@ -1954,7 +1876,9 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 			_ = write(response)
 			return
 		}
-		_ = stream.fail(map[string]any{"error": geminiErrorPayload(err, retryAfterSeconds(err))})
+		_ = write(map[string]any{"error": map[string]any{
+			"code": statusFromError(err), "message": err.Error(), "status": geminiErrorStatus(err),
+		}})
 		return
 	}
 	candidates.record(r.Context(), results)

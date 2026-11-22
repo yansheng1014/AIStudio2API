@@ -102,13 +102,12 @@ func resolveGeminiFileNames(ctx context.Context, service aistudio.Service, conte
 	return nil
 }
 
-// geminiUploadSession 是一次可续传上传的元数据、开始请求的选号范围与已接收的分块
+// geminiUploadSession 是一次可续传上传的元数据与已接收的分块
 type geminiUploadSession struct {
 	mu       sync.Mutex
 	alias    string
 	name     string
 	mime     string
-	scope    context.Context
 	received int64
 	buffer   *os.File
 	expires  time.Time
@@ -280,8 +279,7 @@ func (s *server) startGeminiUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	session := &geminiUploadSession{
 		alias: alias, name: geminiUploadName(metadata, "", r),
-		mime:  firstMediaType(r.Header.Get("X-Goog-Upload-Header-Content-Type"), metadata.File.MIMEType),
-		scope: aistudio.ContextWithSelectionScope(context.Background(), r.Context()),
+		mime: firstMediaType(r.Header.Get("X-Goog-Upload-Header-Content-Type"), metadata.File.MIMEType),
 	}
 	id := s.uploads.start(session)
 	w.Header().Set("X-Goog-Upload-URL", requestOrigin(r)+"/upload/v1beta/files?upload_id="+url.QueryEscape(id)+"&upload_protocol=resumable")
@@ -369,7 +367,7 @@ func (s *server) handleGeminiUploadChunk(w http.ResponseWriter, r *http.Request)
 		}
 		content = session.buffer
 	}
-	metadata, err := uploadGeminiFile(aistudio.ContextWithSelectionScope(r.Context(), session.scope), s.service.(aistudio.FileService), session.alias, session.name, session.mime, content)
+	metadata, err := uploadGeminiFile(r.Context(), s.service.(aistudio.FileService), session.alias, session.name, session.mime, content)
 	s.uploads.discard(id, session)
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
@@ -494,7 +492,7 @@ func readGeminiFileMetadata(body io.Reader) (geminiFileMetadata, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return metadata, nil
 	}
-	raw, err = geminiCamelKeys(doubleQuotedJSON(raw))
+	raw, _, err = geminiCamelKeys(doubleQuotedJSON(raw))
 	if err == nil {
 		err = json.Unmarshal(raw, &metadata)
 	}
@@ -575,8 +573,7 @@ func writeGeminiUploadFailure(w http.ResponseWriter, err error, uploadStatus str
 	if uploadStatus != "" {
 		w.Header().Set("X-Goog-Upload-Status", uploadStatus)
 	}
-	writeGeminiError(w, status, statusName, publicReason(err))
-	setAccessLogResponseError(w, err.Error())
+	writeGeminiError(w, status, statusName, err.Error())
 }
 
 // requestOrigin 返回客户端访问本服务使用的协议与主机

@@ -11,7 +11,6 @@ import (
 	"path"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -184,7 +183,7 @@ func (s *server) publicModels(w http.ResponseWriter, r *http.Request) ([]aistudi
 		}
 		return nil, false
 	}
-	return s.searchModels(models), true
+	return s.uncutModels(s.searchModels(models)), true
 }
 
 func (s *server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
@@ -259,7 +258,6 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	generateRequest = s.prepareSearch(generateRequest)
 	generateRequest.Unary = !request.Stream || s.responseModes().FakeStream
-	media := s.mediaOutputFor(r)
 	if !request.Stream {
 		var stopKeepalive func()
 		w, stopKeepalive = s.nonstreamKeepalive(w, r)
@@ -281,7 +279,7 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	created := time.Now().Unix()
 	if request.Stream {
-		s.streamChatCompletion(w, r, request, requestID, created, choices, media)
+		s.streamChatCompletion(w, r, request, requestID, created, choices)
 		return
 	}
 	results, err := choices.run(func(_ int, events <-chan aistudio.Event) (generationResult, error) {
@@ -305,10 +303,11 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if audio[index], err = s.takeChatAudio(&results[index], format); err != nil {
-			writeOpenAIFailure(w, http.StatusBadGateway, "upstream_error", err)
+			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
 			return
 		}
 	}
+	media := s.mediaOutputFor(r)
 	for index := range results {
 		if err := media.saveEvents(results[index].events); err != nil {
 			writeOpenAIRequestError(w, err)
@@ -644,7 +643,7 @@ func openAIContentBlock(block openAIBlock) (aistudio.Part, error) {
 		if err != nil {
 			return aistudio.Part{}, fmt.Errorf("input_audio.data: %w", err)
 		}
-		return aistudio.Part{InlineData: aistudio.NewBlob(audioMIME(block.InputAudio.Format), data)}, nil
+		return aistudio.Part{InlineData: &aistudio.Blob{MIME: audioMIME(block.InputAudio.Format), Data: data}}, nil
 	default:
 		return aistudio.Part{}, fmt.Errorf("unsupported content type %q", block.Type)
 	}
@@ -690,7 +689,7 @@ func fileOrInlinePart(value string, name string) (aistudio.Part, error) {
 	}
 	mediaType, _, _ := mime.ParseMediaType(metadata)
 	mimeType, data := normalizeImagePayload(attachmentMIME(mediaType, name, data), data)
-	return aistudio.Part{InlineData: aistudio.NewBlob(mimeType, data), DisplayName: name}, nil
+	return aistudio.Part{InlineData: &aistudio.Blob{MIME: mimeType, Data: data}, DisplayName: name}, nil
 }
 
 // fileDataPart 解析 data URL 或 base64 文件内容
@@ -703,7 +702,7 @@ func fileDataPart(value string, name string) (aistudio.Part, error) {
 		return aistudio.Part{}, fmt.Errorf("file_data: %w", err)
 	}
 	mimeType, data := normalizeImagePayload(detectMediaType(name, data), data)
-	return aistudio.Part{InlineData: aistudio.NewBlob(mimeType, data), DisplayName: name}, nil
+	return aistudio.Part{InlineData: &aistudio.Blob{MIME: mimeType, Data: data}, DisplayName: name}, nil
 }
 
 // detectMediaType 按内容前缀判断不带参数的 MIME，无法识别时依次按 FLAC 头、MPEG 音频帧头与扩展名判断
@@ -924,8 +923,8 @@ func (reference toolReference) functionName() string {
 		if reference.Custom != nil {
 			name = reference.Custom.Name
 		}
-		if name != "" {
-			name = namespacedName(reference.Namespace, name)
+		if reference.Namespace != "" && name != "" {
+			name = reference.Namespace + "." + name
 		}
 		return name
 	case "local_shell", "shell", "apply_patch":
@@ -1157,7 +1156,7 @@ func chatCompletionChoice(index int, result generationResult, tools []openAITool
 	return choice
 }
 
-func (s *server) streamChatCompletion(w http.ResponseWriter, r *http.Request, request chatRequest, id string, created int64, choices *chatChoices, media mediaOutput) {
+func (s *server) streamChatCompletion(w http.ResponseWriter, r *http.Request, request chatRequest, id string, created int64, choices *chatChoices) {
 	stream, err := openStream(w, sseHeartbeat)
 	defer stream.stop()
 	if err != nil {
@@ -1175,6 +1174,7 @@ func (s *server) streamChatCompletion(w http.ResponseWriter, r *http.Request, re
 			return
 		}
 	}
+	media := s.mediaOutputFor(r)
 	format, _, _ := request.audioOutput()
 	results, err := choices.run(func(index int, events <-chan aistudio.Event) (generationResult, error) {
 		choice := &chatStreamChoice{server: s, tools: request.Tools, index: index, write: write, media: media, audioFormat: format, audioID: newID("audio")}
@@ -1305,9 +1305,6 @@ func (choice *chatStreamChoice) emit(event aistudio.Event) error {
 }
 
 func writeChatChunk(w http.ResponseWriter, id string, created int64, model string, index int, delta map[string]any, finish *string, includeUsage bool) error {
-	if content, ok := delta["content"].(string); ok && len(delta) == 1 && finish == nil {
-		return writeSSEFrame(w, chatTextChunk(id, created, model, index, content, includeUsage))
-	}
 	choice := map[string]any{
 		"index":         index,
 		"delta":         delta,
@@ -1328,19 +1325,6 @@ func writeChatChunk(w http.ResponseWriter, id string, created int64, model strin
 		chunk["usage"] = nil
 	}
 	return writeSSE(w, "", officialOrder("chat", chunk))
-}
-
-// chatTextChunk 返回只含正文增量的 chat.completion.chunk SSE 帧，字节与按官方字段顺序编码的同一对象相同
-func chatTextChunk(id string, created int64, model string, index int, content string, includeUsage bool) []byte {
-	frame := appendJSONString(append(sseFrameStart("", 160+len(content)), `{"id":`...), id)
-	frame = strconv.AppendInt(append(frame, `,"object":"chat.completion.chunk","created":`...), created, 10)
-	frame = appendJSONString(append(frame, `,"model":`...), model)
-	frame = strconv.AppendInt(append(frame, `,"choices":[{"index":`...), int64(index), 10)
-	frame = append(appendJSONString(append(frame, `,"delta":{"content":`...), content), `},"finish_reason":null}]`...)
-	if includeUsage {
-		frame = append(frame, `,"usage":null`...)
-	}
-	return append(frame, "}\n\n"...)
 }
 
 func openAIFinishReason(reason string, hasTools bool) string {
@@ -1379,8 +1363,13 @@ func legacyFunctionCall(call aistudio.FunctionCall) map[string]any {
 	return map[string]any{"name": call.Name, "arguments": string(call.Arguments)}
 }
 
-// contentFilterFinishReason 判断上游结束原因是否为未知编号，未知编号按官网默认的 Content blocked 处理
+// contentFilterFinishReason 判断上游结束原因是否表示内容策略拦截，未知编号按官网默认的 Content blocked 处理
 func contentFilterFinishReason(reason string) bool {
+	switch reason {
+	case "safety", "recitation", "blocklist", "prohibited_content", "spii",
+		"image_safety", "image_prohibited_content", "image_recitation":
+		return true
+	}
 	return strings.HasPrefix(reason, "provider_")
 }
 

@@ -106,10 +106,7 @@ func (s *App) menuEntries() []menuEntry {
 		slog.Warn("开机自启动设置读取失败", "error", err)
 	}
 	var entries []menuEntry
-	s.mu.Lock()
-	webview := s.webview
-	s.mu.Unlock()
-	if webview {
+	if s.webview {
 		entries = append(entries, menuEntry{label: labels[0], run: s.show})
 	}
 	return append(entries,

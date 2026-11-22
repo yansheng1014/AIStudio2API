@@ -15,22 +15,19 @@ type AdminService interface {
 	Status(context.Context) (AdminStatus, error)
 	CatalogModels(context.Context) ([]aistudio.Model, error)
 	Accounts(context.Context) ([]AdminAccount, error)
-	AccountExits(context.Context) ([]AccountExit, error)
 	CreateAccount(context.Context, AccountCreateInput, *camoufoxnative.LiveView) (AdminAccount, error)
 	ChromeImportProfiles(context.Context) ([]ChromeImportProfile, error)
-	CookieBrowsers(ctx context.Context, proxy string) ([]CookieBrowser, error)
+	CookieBrowsers(context.Context) ([]CookieBrowser, error)
 	DiscoverCookieAccounts(context.Context, CookieImportInput) ([]CookieBrowser, error)
 	ImportChromeAccounts(context.Context, ChromeImportInput) ([]AdminAccount, error)
 	ImportAccountState(context.Context, AccountStateInput) (AdminAccount, error)
 	RenewAccountCookies(ctx context.Context, accountID string, token string, cookies []aistudio.StateCookie) (AdminAccount, error)
 	UpdateAccount(context.Context, string, AccountInput) (AdminAccount, error)
-	SetAccountState(ctx context.Context, accountID string, state string) (AdminAccount, error)
 	DeleteAccount(context.Context, string) error
 	LoginAccount(context.Context, string, *camoufoxnative.LiveView) (AdminAccount, error)
 	RefreshAccount(context.Context, string) (AdminAccountRefresh, error)
 	StartService(context.Context) (AdminStatus, error)
 	StopService(context.Context) (AdminStatus, error)
-	DownloadCamoufox(context.Context) (AdminStatus, error)
 	ClearLogs(context.Context) error
 	RuntimeConfig(context.Context) (RuntimeConfig, error)
 	UpdateRuntimeConfig(context.Context, RuntimeConfig) (RuntimeConfig, error)
@@ -46,22 +43,14 @@ type AdminService interface {
 
 // AdminStatus 表示管理端运行状态
 type AdminStatus struct {
-	State          string                     `json:"state"`
-	Running        bool                       `json:"running"`
-	Ready          bool                       `json:"ready"`
-	Version        string                     `json:"version"`
-	ActiveRequests int                        `json:"active_requests"`
-	Accounts       AdminAccountCounts         `json:"accounts"`
-	Camoufox       camoufoxnative.Preparation `json:"camoufox"`
-	ChromeImport   bool                       `json:"chrome_import"`
-	// Transition 是生成服务正在进行的启动或停止步骤，没有时省略
-	// 启动：probe_proxies 检测代理池，wait_camoufox 等待 Camoufox 下载，wait_catalog 等待首个账户读取模型目录，start_prewarm 开始预热 WAA Worker
-	// 停止：cancel_requests 停止在途请求，wait_catalog_stop 等待模型目录同步停止，close_workers 关闭 WAA Worker
-	Transition string `json:"transition,omitempty"`
-	// TransitionSince 是进入当前步骤的时刻，没有步骤时省略
-	TransitionSince *time.Time `json:"transition_since,omitempty"`
-	// Time 是生成这份状态的服务端时刻，管理页以它换算各阶段的已用时间
-	Time time.Time `json:"time"`
+	State          string             `json:"state"`
+	Running        bool               `json:"running"`
+	Ready          bool               `json:"ready"`
+	Version        string             `json:"version"`
+	ActiveRequests int                `json:"active_requests"`
+	Accounts       AdminAccountCounts `json:"accounts"`
+	Camoufox       AdminCamoufox      `json:"camoufox"`
+	ChromeImport   bool               `json:"chrome_import"`
 }
 
 // InvalidConfigValue 表示加载时取值无效、按默认值生效的一个配置项
@@ -71,67 +60,50 @@ type InvalidConfigValue struct {
 	Reason string `json:"reason"`
 }
 
+// AdminCamoufox 表示 Camoufox 是否就绪与正在进行的下载
+type AdminCamoufox struct {
+	Ready    bool                     `json:"ready"`
+	Download *camoufoxnative.Download `json:"download,omitempty"`
+}
+
 // AdminLog 表示管理页面展示的一条运行日志
 type AdminLog struct {
 	Time    time.Time   `json:"time"`
 	Level   string      `json:"level"`
 	Source  string      `json:"source"`
 	Message string      `json:"message"`
-	Fields  []LogField  `json:"fields,omitempty"`
-	Stage   *LogStage   `json:"stage,omitempty"`
 	Event   string      `json:"event"`
 	Request *RequestLog `json:"request,omitempty"`
 }
 
-// LogField 是日志按顺序排列的一个字段，Key 为英文标识
-type LogField struct {
-	Key   string `json:"key"`
-	Value string `json:"value"`
-}
-
-// LogStage 是分阶段运行日志所属的阶段，Step 与 Steps 为当前步骤与总步骤数，State 为结束状态 completed、failed 或 cancelled
-type LogStage struct {
-	Name  string `json:"name"`
-	Step  int    `json:"step,omitempty"`
-	Steps int    `json:"steps,omitempty"`
-	State string `json:"state,omitempty"`
-}
-
 // RequestLog 保存可关联的请求状态、用量与诊断字段
 type RequestLog struct {
-	ID              string                 `json:"id"`
-	State           string                 `json:"state"`
-	StartedAt       time.Time              `json:"started_at,omitzero"`
-	Model           string                 `json:"model,omitempty"`
-	Method          string                 `json:"method,omitempty"`
-	Path            string                 `json:"path,omitempty"`
-	Status          int                    `json:"status,omitempty"`
-	DurationMS      float64                `json:"duration_ms,omitempty"`
-	Usage           *RequestLogUsage       `json:"usage,omitempty"`
-	ToolCalls       int                    `json:"tool_calls,omitempty"`
-	FinishReason    string                 `json:"finish_reason,omitempty"`
-	Error           string                 `json:"error,omitempty"`
-	InputMessages   int                    `json:"input_messages,omitempty"`
-	InputTextChars  int                    `json:"input_text_chars,omitempty"`
-	InputMedia      int                    `json:"input_media,omitempty"`
-	InputMediaBytes int64                  `json:"input_media_bytes,omitempty"`
-	InputFiles      int                    `json:"input_files,omitempty"`
-	Parameters      map[string]string      `json:"parameters,omitempty"`
-	FirstEventMS    float64                `json:"first_event_ms,omitempty"`
-	QueueMS         float64                `json:"queue_ms,omitempty"`
-	ProofMS         float64                `json:"proof_ms,omitempty"`
-	ProofPhases     *RequestLogProofPhases `json:"proof_phases,omitempty"`
-	UpstreamBytes   int64                  `json:"upstream_bytes,omitempty"`
-	Channel         string                 `json:"channel,omitempty"`
+	ID              string            `json:"id"`
+	State           string            `json:"state"`
+	StartedAt       time.Time         `json:"started_at,omitzero"`
+	Model           string            `json:"model,omitempty"`
+	Method          string            `json:"method,omitempty"`
+	Path            string            `json:"path,omitempty"`
+	Status          int               `json:"status,omitempty"`
+	DurationMS      float64           `json:"duration_ms,omitempty"`
+	Usage           *RequestLogUsage  `json:"usage,omitempty"`
+	ToolCalls       int               `json:"tool_calls,omitempty"`
+	FinishReason    string            `json:"finish_reason,omitempty"`
+	Error           string            `json:"error,omitempty"`
+	InputMessages   int               `json:"input_messages,omitempty"`
+	InputTextChars  int               `json:"input_text_chars,omitempty"`
+	InputMedia      int               `json:"input_media,omitempty"`
+	InputMediaBytes int64             `json:"input_media_bytes,omitempty"`
+	InputFiles      int               `json:"input_files,omitempty"`
+	Parameters      map[string]string `json:"parameters,omitempty"`
+	FirstEventMS    float64           `json:"first_event_ms,omitempty"`
+	QueueMS         float64           `json:"queue_ms,omitempty"`
+	ProofMS         float64           `json:"proof_ms,omitempty"`
+	UpstreamBytes   int64             `json:"upstream_bytes,omitempty"`
+	Channel         string            `json:"channel,omitempty"`
 }
 
-// RequestLogProofPhases 是请求日志中生成 WAA proof 的分项，SettingsSkipped 是空闲不够而没有做的运行设置步数
-type RequestLogProofPhases struct {
-	ProofPhasesMS
-	SettingsSkipped int `json:"settings_skipped,omitempty"`
-}
-
-// RequestLogUsage 区分输入、缓存命中、思考、回复与首字之后的输出速率
+// RequestLogUsage 区分输入、缓存命中、思考、回复与端到端输出速率
 type RequestLogUsage struct {
 	InputTokens            int64   `json:"input_tokens"`
 	CachedTokens           int64   `json:"cached_tokens"`
@@ -139,7 +111,7 @@ type RequestLogUsage struct {
 	ReplyTokens            int64   `json:"reply_tokens"`
 	OutputTokens           int64   `json:"output_tokens"`
 	TotalTokens            int64   `json:"total_tokens"`
-	AverageTokensPerSecond float64 `json:"average_tokens_per_second,omitempty"`
+	AverageTokensPerSecond float64 `json:"average_tokens_per_second"`
 }
 
 // AccessLog 表示一次公开 API 请求的最终访问记录
@@ -147,10 +119,8 @@ type AccessLog struct {
 	Status          int
 	Latency         time.Duration
 	FirstEvent      time.Duration
-	FirstOutput     int64
-	TrailingError   string
 	QueueWait       time.Duration
-	Proof           ProofTiming
+	Proof           time.Duration
 	UpstreamBytes   int64
 	Usage           *aistudio.Usage
 	ToolCalls       int
@@ -202,32 +172,6 @@ type AdminAccount struct {
 
 	// PairingRenewedAt 是远程配对账户最近一次由原电脑续签的时间，没有经配对续签时省略
 	PairingRenewedAt *time.Time `json:"pairing_renewed_at,omitempty"`
-
-	// Transition 是账户正在进行的后台操作，没有时省略
-	// draining 为停用后等待在途请求结束并关闭 Worker，syncing 为启用、添加、导入或重新登录后同步模型目录，saving 为保存配置或登录状态，refreshing 为立即刷新
-	Transition string `json:"transition,omitempty"`
-	// TransitionStep 是后台操作当前的步骤，操作没有分步时省略
-	// waiting 为等该账户的在途请求结束，catalog 为读取权益与模型目录，verifying 为发一次生成请求核对验证状态
-	TransitionStep string `json:"transition_step,omitempty"`
-	// TransitionIndex 与 TransitionTotal 是立即刷新当前步骤的序号与步数，其他操作省略
-	TransitionIndex int `json:"transition_index,omitempty"`
-	TransitionTotal int `json:"transition_total,omitempty"`
-	// TransitionSince 是进入当前操作或步骤的时刻，没有后台操作时省略
-	TransitionSince *time.Time `json:"transition_since,omitempty"`
-	// ActiveRequests 是账户上进行中的请求数
-	ActiveRequests int `json:"active_requests"`
-	// CatalogError 是已有模型目录的账户最近一次目录同步失败的原因，下一次同步成功后省略
-	CatalogError string `json:"catalog_error,omitempty"`
-}
-
-// AccountExit 表示一个账户出口代理的公网 IP 与按 IP 定位的国家、时区和语言，Proxy 为空时是直连，查询失败时 Error 为原因
-type AccountExit struct {
-	Proxy    string `json:"proxy"`
-	IP       string `json:"ip,omitempty"`
-	Country  string `json:"country,omitempty"`
-	Timezone string `json:"timezone,omitempty"`
-	Locale   string `json:"locale,omitempty"`
-	Error    string `json:"error,omitempty"`
 }
 
 // AdminProxy 表示代理池中一个代理的可用性与绑定账户数
@@ -276,8 +220,7 @@ type ChromeImportProfile struct {
 	Profile     string `json:"profile"`
 	DisplayName string `json:"display_name"`
 	Email       string `json:"email"`
-	// Restricted 是该账户服务受限的原因，受限的账户不能导入
-	Restricted string `json:"restricted"`
+	Locale      string `json:"locale"`
 }
 
 // CookieBrowser 表示本机开启远程调试的浏览器与其中登录 AI Studio 的账户
@@ -286,16 +229,14 @@ type CookieBrowser struct {
 	Browser   string `json:"browser"`
 	Email     string `json:"email"`
 	AuthUser  int    `json:"auth_user"`
+	Locale    string `json:"locale"`
+	Timezone  string `json:"timezone"`
 	Imported  bool   `json:"imported"`
 	SignedOut bool   `json:"signed_out"`
 	Error     string `json:"error"`
-	// Restricted 是该账户服务受限的原因，受限的账户不能导入
-	Restricted string `json:"restricted"`
 
 	// DeviceBound 表示 Cookie 带 __Secure-1PSIDRTS，会话绑定原浏览器所在的设备，导入的副本约 2 小时内失效
 	DeviceBound bool `json:"device_bound"`
-	// SignInRequired 表示该账户已导入且需要重新登录，导入时原地更新它的认证状态
-	SignInRequired bool `json:"sign_in_required"`
 }
 
 // ChromeImportInput 表示批量导入的 Chrome 账号与账户环境
@@ -309,7 +250,6 @@ type ChromeImportInput struct {
 // RuntimeConfig 表示全局运行配置
 type RuntimeConfig struct {
 	AutoStart                 bool                 `json:"auto_start"`
-	HideDockIcon              bool                 `json:"hide_dock_icon"`
 	RequestBodyLog            bool                 `json:"request_body_log"`
 	AdminAuthEnabled          bool                 `json:"admin_auth_enabled"`
 	AdminUsername             string               `json:"admin_username"`
@@ -322,7 +262,6 @@ type RuntimeConfig struct {
 	YouTubeLinks              bool                 `json:"youtube_links"`
 	StripThoughtSignatures    bool                 `json:"strip_thought_signatures"`
 	SearchModelAliases        bool                 `json:"search_model_aliases"`
-	DiscoverHiddenModels      bool                 `json:"discover_hidden_models"`
 	GoogleSearch              bool                 `json:"google_search"`
 	FirstEventHedge           string               `json:"first_event_hedge"`
 	FirstEventHedgeModels     string               `json:"first_event_hedge_models"`
@@ -349,13 +288,17 @@ type RuntimeConfig struct {
 	MaxActiveWorkers          int                  `json:"max_active_workers"`
 	WarmStartupConcurrency    int                  `json:"warm_startup_concurrency"`
 	PerAccountConcurrency     int                  `json:"per_account_concurrency"`
+	CleanupEnabled            bool                 `json:"cleanup_enabled"`
+	CleanupIntervalSeconds    int                  `json:"cleanup_interval_seconds"`
+	CleanupIdleSeconds        int                  `json:"cleanup_idle_seconds"`
+	CleanupActionGapSeconds   int                  `json:"cleanup_action_gap_seconds"`
+	CleanupMemoryHighMB       int                  `json:"cleanup_memory_high_mb"`
+	CleanupMemoryCriticalMB   int                  `json:"cleanup_memory_critical_mb"`
+	CleanupGoHeapMB           int                  `json:"cleanup_go_heap_mb"`
 	RoutingStrategy           string               `json:"routing_strategy"`
-	AccountOrder              string               `json:"account_order"`
-	MaxAccountSwitches        int                  `json:"max_account_switches"`
 	UpstreamChannels          []string             `json:"upstream_channels"`
 	ModelMapping              string               `json:"model_mapping"`
 	ModelChannels             string               `json:"model_channels"`
-	ModelAccounts             string               `json:"model_accounts"`
 	APIKeyAccounts            string               `json:"api_key_accounts"`
 	WAABackend                string               `json:"waa_backend"`
 	MediaOutput               string               `json:"media_output"`
@@ -384,10 +327,6 @@ type AdminRequest struct {
 	Channel      string    `json:"channel,omitempty"`
 	State        string    `json:"state"`
 	StartedAt    time.Time `json:"started_at"`
-	// SentAt 是请求最近一次取得账户发往上游的时刻，排队中为零值
-	SentAt time.Time `json:"sent_at,omitzero"`
-	// LastDataAt 是最近一次收到上游输出的时刻，收到首个输出前为零值
-	LastDataAt time.Time `json:"last_data_at,omitzero"`
 }
 
 // AdminEvent 表示管理端增量事件
@@ -398,7 +337,6 @@ type AdminEvent struct {
 
 func (s *server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/accounts", s.handleAccounts)
-	mux.HandleFunc("GET /api/accounts/exits", s.handleAccountExits)
 	mux.HandleFunc("POST /api/accounts", s.handleCreateAccount)
 	mux.HandleFunc("GET /api/accounts/import/chrome", s.handleChromeImportProfiles)
 	mux.HandleFunc("POST /api/accounts/import/chrome", s.handleImportChromeAccounts)
@@ -409,17 +347,13 @@ func (s *server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/accounts/tasks/{id}", s.handleDeleteAccountTask)
 	mux.HandleFunc("GET /api/pairing", s.handleActivePairing)
 	mux.HandleFunc("POST /api/pairing", s.handleCreatePairing)
-	mux.HandleFunc("GET /api/paths", s.handlePaths)
-	mux.HandleFunc("POST /api/paths/pick", s.handlePickPath)
 	mux.HandleFunc("PUT /api/accounts/{id}", s.handleUpdateAccount)
-	mux.HandleFunc("PUT /api/accounts/{id}/state", s.handleSetAccountState)
 	mux.HandleFunc("DELETE /api/accounts/{id}", s.handleDeleteAccount)
 	mux.HandleFunc("POST /api/accounts/{id}/login", s.handleLoginAccount)
 	mux.HandleFunc("GET /api/login-view/{view}", s.handleLoginView)
 	mux.HandleFunc("POST /api/accounts/{id}/refresh", s.handleRefreshAccount)
 	mux.HandleFunc("POST /api/control/start", s.handleStartService)
 	mux.HandleFunc("POST /api/control/stop", s.handleStopService)
-	mux.HandleFunc("POST /api/camoufox/download", s.handleDownloadCamoufox)
 	mux.HandleFunc("DELETE /api/logs", s.handleClearLogs)
 	mux.HandleFunc("GET /api/config", s.handleRuntimeConfig)
 	mux.HandleFunc("PUT /api/config", s.handleUpdateRuntimeConfig)
@@ -427,7 +361,6 @@ func (s *server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/cooldowns", s.handleCooldowns)
 	mux.HandleFunc("DELETE /api/accounts/{id}/cooldowns/{scope}", s.handleClearCooldown)
 	mux.HandleFunc("GET /api/requests", s.handleRequests)
-	mux.HandleFunc("POST /api/video-tokens", s.handleVideoTokens)
 	mux.HandleFunc("POST /api/requests/{id}/cancel", s.handleCancelRequest)
 	mux.HandleFunc("GET /api/events", s.handleAdminEvents)
 }
@@ -463,15 +396,6 @@ func (s *server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string][]AdminAccount{"accounts": accounts})
 }
 
-func (s *server) handleAccountExits(w http.ResponseWriter, r *http.Request) {
-	exits, err := s.config.Admin.AccountExits(r.Context())
-	if err != nil {
-		writeAdminUpstreamError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string][]AccountExit{"exits": exits})
-}
-
 func (s *server) handleChromeImportProfiles(w http.ResponseWriter, r *http.Request) {
 	profiles, err := s.config.Admin.ChromeImportProfiles(r.Context())
 	if err != nil {
@@ -482,7 +406,7 @@ func (s *server) handleChromeImportProfiles(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *server) handleCookieBrowsers(w http.ResponseWriter, r *http.Request) {
-	browsers, err := s.config.Admin.CookieBrowsers(r.Context(), r.URL.Query().Get("proxy"))
+	browsers, err := s.config.Admin.CookieBrowsers(r.Context())
 	if err != nil {
 		writeAdminUpstreamError(w, err)
 		return
@@ -518,23 +442,6 @@ func (s *server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]AdminAccount{"account": account})
 }
 
-// handleSetAccountState 把账户改为正文 state 给出的就绪或停用
-func (s *server) handleSetAccountState(w http.ResponseWriter, r *http.Request) {
-	var input struct {
-		State string `json:"state"`
-	}
-	if err := decodeJSON(r, &input); err != nil {
-		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-	account, err := s.config.Admin.SetAccountState(r.Context(), r.PathValue("id"), input.State)
-	if err != nil {
-		writeAdminUpstreamError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]AdminAccount{"account": account})
-}
-
 func (s *server) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	if err := s.config.Admin.DeleteAccount(r.Context(), r.PathValue("id")); err != nil {
 		writeAdminUpstreamError(w, err)
@@ -554,16 +461,6 @@ func (s *server) handleRefreshAccount(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) handleStartService(w http.ResponseWriter, r *http.Request) {
 	status, err := s.config.Admin.StartService(r.Context())
-	if err != nil {
-		writeAdminUpstreamError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, status)
-}
-
-// handleDownloadCamoufox 在后台重新开始下载 Camoufox 并返回服务状态
-func (s *server) handleDownloadCamoufox(w http.ResponseWriter, r *http.Request) {
-	status, err := s.config.Admin.DownloadCamoufox(r.Context())
 	if err != nil {
 		writeAdminUpstreamError(w, err)
 		return

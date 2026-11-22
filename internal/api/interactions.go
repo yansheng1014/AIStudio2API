@@ -64,10 +64,6 @@ func (s *server) handleInteraction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if previous.Upstream != "" && previous.Agent == generate.Model {
-			if requested := requestedAccount(r); requested != "" && requested != previous.AccountID {
-				writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "previous_interaction_id was created by a different account than X-AIStudio-Account")
-				return
-			}
 			// 同一 agent 续接自己的后台任务时与官网一样只发送新输入并以其上游 interaction 续接，使用创建它的账户
 			generate.PreviousInteractionID, generate.AccountID = previous.Upstream, previous.AccountID
 		} else {
@@ -288,9 +284,6 @@ func interactionObject(request aistudio.GenerateRequest, previousID string, crea
 	}
 	if previousID != "" {
 		object["previous_interaction_id"] = previousID
-	}
-	if result != nil && result.environmentID != "" {
-		object["environment_id"] = result.environmentID
 	}
 	if result != nil && result.usage != nil {
 		usage := result.usage

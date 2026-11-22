@@ -3,14 +3,11 @@ package aistudio
 import (
 	"encoding/json"
 	"strings"
-	"unsafe"
 )
 
 // Output 按上游顺序累积一次生成的内容 Part，同一 Part 的流式正文与 PCM 音频分块合并
 type Output struct {
 	Parts []Part
-	// tail 是最后一个 Part 正文所在的字节缓冲，续写的正文追加在末尾
-	tail []byte
 }
 
 // Add 并入一个内容事件
@@ -23,18 +20,13 @@ func (output *Output) Add(event Event) {
 		last := &output.Parts[count-1]
 		switch {
 		case continuesText(*last, part):
-			if len(output.tail) != len(last.Text) || len(last.Text) > 0 && unsafe.StringData(last.Text) != &output.tail[0] {
-				output.tail = append(output.tail[:0:0], last.Text...)
-			}
-			output.tail = append(output.tail, part.Text...)
-			last.Text = unsafe.String(&output.tail[0], len(output.tail))
+			last.Text += part.Text
 			return
 		case MergePCM(last, part):
 			return
 		}
 	}
 	output.Parts = append(output.Parts, part)
-	output.tail = nil
 }
 
 // Visible 返回非思考 Part

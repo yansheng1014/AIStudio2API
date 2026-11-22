@@ -112,6 +112,12 @@ function modelItem(model: Model): PaletteItem {
   }
 }
 
+// sessionLabel 返回最近记录的会话类型
+function sessionLabel(summary: PromptSummary): string {
+  const model = store.models.value.find((item) => item.id === summary.model)
+  return pageKindOf(model) === 'video' ? t('pg.videoSession') : t('pg.chatSession')
+}
+
 // matches 判断文字是否包含查询
 const matches = (text: string) => text.toLowerCase().includes(query.value.trim().toLowerCase())
 
@@ -195,7 +201,7 @@ const sections = computed<{ title: string; items: PaletteItem[] }[]>(() => {
     id: summary.id,
     icon: 'chatBubble',
     label: summary.title || t('pg.untitled'),
-    description: t('pg.chatSession'),
+    description: sessionLabel(summary),
     run: () => openPage(`/prompts/${encodeURIComponent(summary.id)}`),
   }))
   if (text === '')

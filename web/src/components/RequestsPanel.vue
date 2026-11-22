@@ -1,14 +1,13 @@
 <script setup lang="ts">
-import { computed, onUnmounted, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { api } from '@/api'
 import { channelLabelKey, useI18n, type TranslationKey } from '@/i18n'
-import { formatLogNumber } from '@/logs'
 import { usePaged } from '@/paging'
 import type { Account, Cooldown, RequestState, RequestSummary } from '@/types'
 import DetailDialog from './DetailDialog.vue'
 import UiIcon from './UiIcon.vue'
 import UiPager from './UiPager.vue'
-import UiSelect, { keepSelected } from './UiSelect.vue'
+import UiSelect from './UiSelect.vue'
 
 const props = defineProps<{
   accounts: Account[]
@@ -30,12 +29,8 @@ const refreshing = ref(false)
 const selectedCategory = ref('')
 const cooldownModel = ref('')
 const requestModel = ref('')
-const cooldownModels = computed(() =>
-  keepSelected([...new Set(props.cooldowns.map((item) => item.model_id))], cooldownModel.value, ''),
-)
-const requestModels = computed(() =>
-  keepSelected([...new Set(props.requests.map((item) => item.model))], requestModel.value, ''),
-)
+const cooldownModels = computed(() => [...new Set(props.cooldowns.map((item) => item.model_id))])
+const requestModels = computed(() => [...new Set(props.requests.map((item) => item.model))])
 const modelCooldowns = computed(() =>
   props.cooldowns.filter(
     (item) => cooldownModel.value === '' || item.model_id === cooldownModel.value,
@@ -120,38 +115,12 @@ const requestStateKeys: Record<RequestState, TranslationKey> = {
   failed: 'state.failed',
 }
 
-// active 判断请求是否仍在排队或运行
-function active(request: RequestSummary): boolean {
-  return request.state === 'queued' || request.state === 'running'
-}
-
-const activeCount = computed(() => visibleRequests.value.filter(active).length)
-
-// now 是有活动请求时每秒更新的当前时间
-const now = ref(Date.now())
-let ticker: number | undefined
-watch(
-  () => props.requests.some(active),
-  (live) => {
-    window.clearInterval(ticker)
-    ticker = live ? window.setInterval(() => (now.value = Date.now()), 1000) : undefined
-    now.value = Date.now()
-  },
-  { immediate: true },
+const activeCount = computed(
+  () =>
+    visibleRequests.value.filter(
+      (request) => request.state === 'queued' || request.state === 'running',
+    ).length,
 )
-onUnmounted(() => window.clearInterval(ticker))
-
-// phaseText 返回活动请求所处阶段与该阶段的计时
-function phaseText(request: RequestSummary): string {
-  const [key, since] =
-    request.state === 'queued'
-      ? (['requests.phaseQueued', request.started_at] as const)
-      : request.last_data_at === undefined
-        ? (['requests.phaseSent', request.sent_at ?? request.started_at] as const)
-        : (['requests.phaseStreaming', request.last_data_at] as const)
-  const seconds = Math.max(0, Math.floor((now.value - Date.parse(since)) / 1000))
-  return t(key).replace('{duration}', formatLogNumber(seconds, locale.value, 0, 'second'))
-}
 
 const accountLabels = computed(
   () => new Map(props.accounts.map((account) => [account.id, account.label])),
@@ -162,21 +131,15 @@ function accountLabel(id: string, label: string): string {
   return label || accountLabels.value.get(id) || '—'
 }
 
-// timeFormat 是当前语言的请求时间格式
-const timeFormat = computed(
-  () =>
-    new Intl.DateTimeFormat(locale.value, {
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-    }),
-)
-
 // formatTime 根据当前语言显示请求时间
 function formatTime(value: string): string {
-  return timeFormat.value.format(new Date(value))
+  return new Intl.DateTimeFormat(locale.value, {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).format(new Date(value))
 }
 
 // refresh 请求刷新数据，图标短暂旋转确认点击
@@ -220,7 +183,7 @@ async function clearCooldown(cooldown: Cooldown): Promise<void> {
     class="flex min-h-0 flex-1 flex-col overflow-auto max-md:[scrollbar-gutter:stable] md:overflow-hidden"
   >
     <header
-      class="page-x flex flex-wrap items-center gap-3 border-b border-line py-4 md:overflow-hidden md:[scrollbar-gutter:stable]"
+      class="flex flex-wrap items-center gap-3 border-b border-line px-4 py-4 md:px-[max(2rem,calc((100%_-_var(--container-6xl))/2_+_2rem))]"
     >
       <div class="min-w-0 flex-1">
         <h2 class="text-xl font-semibold text-white">{{ t('section.requests.title') }}</h2>
@@ -237,16 +200,14 @@ async function clearCooldown(cooldown: Cooldown): Promise<void> {
       </button>
     </header>
     <div
-      class="page-x grid min-h-0 flex-1 gap-4 py-4 max-md:shrink-0 max-md:basis-auto md:grid-rows-[minmax(0,3fr)_minmax(0,2fr)] md:overflow-hidden md:py-8 md:[scrollbar-gutter:stable] lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] lg:grid-rows-1"
+      class="mx-auto grid min-h-0 w-full max-w-6xl flex-1 gap-4 p-4 max-md:shrink-0 max-md:basis-auto md:grid-rows-[minmax(0,3fr)_minmax(0,2fr)] md:p-8 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] lg:grid-rows-1"
     >
       <article
         class="flex min-h-0 flex-col overflow-hidden rounded-lg border border-line bg-panel max-md:max-h-[70vh]"
       >
         <div class="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
-          <h3 class="text-sm font-semibold text-gray-200">{{ t('cooldowns.title') }}</h3>
-          <span class="min-w-[2ch] font-mono text-xs text-gray-500">{{
-            visibleCooldowns.length
-          }}</span>
+          <h3 class="font-bold text-gray-300">{{ t('cooldowns.title') }}</h3>
+          <span class="font-mono text-xs text-gray-500">{{ visibleCooldowns.length }}</span>
           <UiSelect
             v-model="cooldownModel"
             :aria-label="t('requests.filterModel')"
@@ -335,7 +296,7 @@ async function clearCooldown(cooldown: Cooldown): Promise<void> {
         <div
           class="flex flex-wrap items-center justify-between gap-2 border-b border-line px-4 py-3"
         >
-          <h3 class="text-sm font-semibold text-gray-200">{{ t('requests.history') }}</h3>
+          <h3 class="font-bold text-gray-300">{{ t('requests.history') }}</h3>
           <span class="text-xs text-green-400"> {{ t('requests.live') }}: {{ activeCount }} </span>
           <UiSelect
             v-model="requestModel"
@@ -376,7 +337,7 @@ async function clearCooldown(cooldown: Cooldown): Promise<void> {
                 <span v-tooltip.overflow="request.model" class="truncate text-sm text-gray-200">{{
                   request.model
                 }}</span>
-                <span v-if="!active(request)" class="shrink-0 text-xs text-gray-500">{{
+                <span class="shrink-0 text-xs text-gray-500">{{
                   t(requestStateKeys[request.state])
                 }}</span>
               </div>
@@ -392,15 +353,12 @@ async function clearCooldown(cooldown: Cooldown): Promise<void> {
                   · {{ t(channelLabelKey(request.channel)) }}</template
                 ></span
               >
-              <span v-if="active(request)" class="block text-xs break-words text-gray-400">{{
-                phaseText(request)
-              }}</span>
             </div>
             <time class="shrink-0 font-mono text-xs whitespace-nowrap text-gray-500">{{
               formatTime(request.started_at)
             }}</time>
             <button
-              v-if="active(request)"
+              v-if="request.state === 'queued' || request.state === 'running'"
               class="shrink-0 rounded border border-red-900/50 bg-red-900/30 px-3 py-1 text-xs text-red-400 transition hover:bg-red-900/50 disabled:opacity-50"
               type="button"
               :disabled="cancelling !== ''"

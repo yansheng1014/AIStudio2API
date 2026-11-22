@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"io"
 	"math/big"
-	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -25,8 +24,7 @@ import (
 
 	http "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
-
-	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
+	"github.com/bogdanfinn/tls-client/profiles"
 )
 
 // ErrCredentialsRejected 表示上游已拒绝保存的 Chrome 续签材料
@@ -43,9 +41,6 @@ func multiloginStatusError(phase string, statusCode int, status string) error {
 
 // multiloginURL 是 OAuthMultilogin 的地址
 var multiloginURL = "https://accounts.google.com/oauth/multilogin?source=ChromiumAccountReconcilorDice&reuseCookies=0"
-
-// gaiaURL 是解析 DBSC 相对刷新地址的 Gaia 地址
-var gaiaURL = &url.URL{Scheme: "https", Host: "accounts.google.com", Path: "/"}
 
 const (
 	oauthClientID     = "77185425430.apps.googleusercontent.com"
@@ -74,36 +69,6 @@ type multiloginResponse struct {
 			Challenge string `json:"challenge"`
 		} `json:"token_binding_retry_response"`
 	} `json:"failed_accounts"`
-	BoundSessions []struct {
-		IsDeviceBound bool   `json:"is_device_bound"`
-		Domain        string `json:"domain"`
-		Payload       *struct {
-			SessionID   string `json:"session_identifier"`
-			RefreshURL  string `json:"refresh_url"`
-			Credentials []struct {
-				Name string `json:"name"`
-			} `json:"credentials"`
-		} `json:"register_session_payload"`
-	} `json:"device_bound_session_info"`
-}
-
-// googleBoundSession 返回响应为 google.com 登记的 DBSC 会话，相对刷新地址按 Gaia 地址解析
-func (response multiloginResponse) googleBoundSession() *aistudio.BoundSession {
-	for _, session := range response.BoundSessions {
-		if !session.IsDeviceBound || session.Domain != "GOOGLE_COM" || session.Payload == nil {
-			continue
-		}
-		refreshURL, err := url.Parse(session.Payload.RefreshURL)
-		if err != nil {
-			return nil
-		}
-		bound := &aistudio.BoundSession{ID: session.Payload.SessionID, RefreshURL: gaiaURL.ResolveReference(refreshURL).String()}
-		for _, credential := range session.Payload.Credentials {
-			bound.Credentials = append(bound.Credentials, credential.Name)
-		}
-		return bound
-	}
-	return nil
 }
 
 type deviceBindingKey interface {
@@ -194,16 +159,15 @@ func acceptLanguageHeader(languages string) string {
 	return header.String()
 }
 
-// fetchGoogleCookies 用 refresh token 经 OAuthMultilogin 取得 Google Cookie，有设备绑定密钥时走 DBSC 挑战与 HPKE 解密，并返回 google.com 的 DBSC 会话登记
-func fetchGoogleCookies(ctx context.Context, identity chromeIdentity, gaiaID string, token string, wrappedKey []byte, proxyURL string) ([]multiloginCookie, *aistudio.BoundSession, error) {
-	client, err := newOAuthClient(proxyURL, chromeIdle)
+// fetchGoogleCookies 用 refresh token 经 OAuthMultilogin 取得 Google Cookie，有设备绑定密钥时走 DBSC 挑战与 HPKE 解密
+func fetchGoogleCookies(ctx context.Context, identity chromeIdentity, gaiaID string, token string, wrappedKey []byte, proxyURL string) ([]multiloginCookie, error) {
+	client, err := newOAuthClient(proxyURL)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer client.CloseIdleConnections()
 	if len(wrappedKey) == 0 {
-		cookies, err := fetchBearerCookies(ctx, client, identity, gaiaID, token)
-		return cookies, nil, err
+		return fetchBearerCookies(ctx, client, identity, gaiaID, token)
 	}
 	return fetchBoundCookies(ctx, client, identity, gaiaID, token, wrappedKey)
 }
@@ -224,53 +188,53 @@ func fetchBearerCookies(ctx context.Context, client tls_client.HttpClient, ident
 }
 
 // fetchBoundCookies 为设备绑定的 token 取得 DBSC challenge、以设备密钥签发 assertion，再解密服务端返回的 Cookie
-func fetchBoundCookies(ctx context.Context, client tls_client.HttpClient, identity chromeIdentity, gaiaID string, token string, wrappedKey []byte) ([]multiloginCookie, *aistudio.BoundSession, error) {
+func fetchBoundCookies(ctx context.Context, client tls_client.HttpClient, identity chromeIdentity, gaiaID string, token string, wrappedKey []byte) ([]multiloginCookie, error) {
 	bindingKey, err := openDeviceBindingKey(wrappedKey)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer bindingKey.Close()
 	spki, err := bindingKey.PublicKey()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	firstStatus, first, err := requestMultilogin(ctx, client, identity, gaiaID, token, assertionSentinel)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	challenge := findChallenge(first)
 	if first.Status != "RETRY" || challenge == "" {
-		return nil, nil, multiloginStatusError("challenge", firstStatus, first.Status)
+		return nil, multiloginStatusError("challenge", firstStatus, first.Status)
 	}
 
 	ephemeralPrivateKey, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
-		return nil, nil, fmt.Errorf("生成 HPKE 临时密钥: %w", err)
+		return nil, fmt.Errorf("生成 HPKE 临时密钥: %w", err)
 	}
 	assertion, err := createAssertion(bindingKey, spki, challenge, ephemeralPrivateKey.PublicKey().Bytes())
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	secondStatus, second, err := requestMultilogin(ctx, client, identity, gaiaID, token, assertion)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if secondStatus != http.StatusOK || second.Status != "OK" {
-		return nil, nil, multiloginStatusError("assertion", secondStatus, second.Status)
+		return nil, multiloginStatusError("assertion", secondStatus, second.Status)
 	}
 	if len(second.Directed) == 0 || bytes.Equal(second.Directed, []byte("null")) {
-		return nil, nil, fmt.Errorf("OAuthMultilogin 响应缺少 token_binding_directed_response")
+		return nil, fmt.Errorf("OAuthMultilogin 响应缺少 token_binding_directed_response")
 	}
 	if err := checkMultiloginCookies(second.Cookies); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	for index := range second.Cookies {
 		if second.Cookies[index].Value, err = hpkeOpen(ephemeralPrivateKey, second.Cookies[index].Value); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 	}
-	return second.Cookies, second.googleBoundSession(), nil
+	return second.Cookies, nil
 }
 
 // checkMultiloginCookies 核对 OAuthMultilogin 返回的 Cookie 带有名称、值、域，并包含 SAPISID 与 __Secure-1PSID
@@ -294,6 +258,23 @@ func checkMultiloginCookies(cookies []multiloginCookie) error {
 		}
 	}
 	return nil
+}
+
+func newOAuthClient(proxyURL string) (tls_client.HttpClient, error) {
+	options := []tls_client.HttpClientOption{
+		tls_client.WithTimeoutSeconds(30),
+		tls_client.WithClientProfile(profiles.Chrome_146),
+		tls_client.WithNotFollowRedirects(),
+		tls_client.WithCookieJar(tls_client.NewCookieJar()),
+	}
+	if proxyURL != "" {
+		options = append(options, tls_client.WithProxyUrl(proxyURL))
+	}
+	client, err := tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
+	if err != nil {
+		return nil, fmt.Errorf("创建 OAuth HTTP 客户端: %w", err)
+	}
+	return client, nil
 }
 
 // requestMultilogin 按 Chrome 的请求头发送一次 OAuthMultilogin：带 assertion 时用 MultiOAuth 头，没有设备绑定的 token 用 MultiBearer 头

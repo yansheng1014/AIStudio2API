@@ -1,7 +1,6 @@
 import {
   Activity,
   ArrowDownRight,
-  ArrowUp,
   ArrowUpRight,
   Boxes,
   Cable,
@@ -9,20 +8,16 @@ import {
   ChartColumn,
   Check,
   ChevronDown,
-  ChevronUp,
   ChevronLeft,
   ChevronRight,
   CircleCheck,
   CircleDollarSign,
-  CircleHelp,
   Coins,
   Columns3,
   Cookie,
   Copy,
   Download,
-  Folder,
   Gauge,
-  GripVertical,
   Inbox,
   KeyRound,
   Languages,
@@ -72,7 +67,6 @@ import {
   Binary,
   Radio,
   Bot,
-  Scale,
   FileText,
 } from '@lucide/vue'
 
@@ -88,7 +82,6 @@ export const icons = {
   playground: MessagesSquare,
   version: Tag,
   chevronDown: ChevronDown,
-  chevronUp: ChevronUp,
   chevronRight: ChevronRight,
   close: X,
   check: Check,
@@ -148,13 +141,7 @@ export const icons = {
   embedding: Binary,
   live: Radio,
   agent: Bot,
-  decision: Scale,
   file: FileText,
-  folder: Folder,
-  help: CircleHelp,
-  arrowUp: ArrowUp,
-  grip: GripVertical,
-  boxes: Boxes,
 } as const
 
 // IconName 是界面可用的图标语义名

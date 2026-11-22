@@ -119,6 +119,7 @@ watch(
     <PaidUsageZeroState
       v-if="state.turns.length === 0"
       :title="t('pg.imagenEmptyTitle')"
+      layout="mosaic"
       icon="modelImage"
       :suggestions="suggestions"
       @select="runSuggestion"

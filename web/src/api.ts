@@ -3,7 +3,6 @@ import { keepPage } from '@/desktop'
 import type {
   Account,
   AccountDraft,
-  AccountExit,
   AccountLoginInput,
   AccountRefresh,
   AccountTask,
@@ -15,7 +14,6 @@ import type {
   FirstEventLatency,
   ChromeImportProfile,
   PairingToken,
-  PathListing,
   Model,
   PromptInput,
   PromptSummary,
@@ -27,7 +25,6 @@ import type {
   ServiceConfig,
   ServiceStatus,
   UpdateStatus,
-  UsagePair,
   UsageRecordPage,
   UsageReport,
 } from '@/types'
@@ -135,16 +132,12 @@ export const api = {
     requestJSON<UpdateStatus>(refresh ? '/api/update?refresh=1' : '/api/update'),
   applyUpdate: () => requestJSON<UpdateStatus>('/api/update', { method: 'POST' }),
   accounts: async () => (await requestJSON<AccountsResponse>('/api/accounts')).accounts,
-  accountExits: async () =>
-    (await requestJSON<{ exits: AccountExit[] }>('/api/accounts/exits')).exits,
   models: async () => (await requestJSON<ModelsResponse>('/api/models')).models,
   cooldowns: async () => (await requestJSON<CooldownsResponse>('/api/cooldowns')).cooldowns,
   requests: async () => (await requestJSON<RequestsResponse>('/api/requests')).requests,
   config: () => requestJSON<ServiceConfig>('/api/config'),
   usage: (query: URLSearchParams, signal: AbortSignal) =>
     requestJSON<UsageReport>(`/api/usage?${query.toString()}`, { signal }),
-  usagePairs: async (query: URLSearchParams) =>
-    (await requestJSON<{ pairs: UsagePair[] }>(`/api/usage/pairs?${query.toString()}`)).pairs,
   usageRecords: (query: URLSearchParams, signal: AbortSignal) =>
     requestJSON<UsageRecordPage>(`/api/usage/records?${query.toString()}`, { signal }),
   usageExportURL: (query: URLSearchParams) => `/api/usage/records.csv?${query.toString()}`,
@@ -166,12 +159,8 @@ export const api = {
         body: jsonBody(input),
       })
     ).task,
-  cookieBrowsers: async (proxy: string) =>
-    (
-      await requestJSON<{ browsers: CookieBrowser[] }>(
-        `/api/accounts/import/browsers?${new URLSearchParams({ proxy })}`,
-      )
-    ).browsers,
+  cookieBrowsers: async () =>
+    (await requestJSON<{ browsers: CookieBrowser[] }>('/api/accounts/import/browsers')).browsers,
   discoverCookieAccounts: async (input: CookieImportInput) =>
     (
       await requestJSON<{ accounts: CookieBrowser[] }>('/api/accounts/import/cookies/discover', {
@@ -190,16 +179,10 @@ export const api = {
     requestCommand(`/api/accounts/tasks/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   activePairing: () => requestJSON<PairingToken>('/api/pairing'),
   createPairing: () => requestJSON<PairingToken>('/api/pairing', { method: 'POST' }),
-  updateAccount: (id: string, draft: AccountDraft, signal?: AbortSignal) =>
+  updateAccount: (id: string, draft: AccountDraft) =>
     requestCommand(`/api/accounts/${encodeURIComponent(id)}`, {
       method: 'PUT',
       body: jsonBody(draft),
-      signal: signal ?? null,
-    }),
-  setAccountState: (id: string, state: 'ready' | 'disabled') =>
-    requestCommand(`/api/accounts/${encodeURIComponent(id)}/state`, {
-      method: 'PUT',
-      body: jsonBody({ state }),
     }),
   deleteAccount: (id: string, keepalive: boolean) =>
     requestCommand(`/api/accounts/${encodeURIComponent(id)}`, { method: 'DELETE', keepalive }),
@@ -212,18 +195,12 @@ export const api = {
     ).task,
   loginViewURL: (view: string) =>
     `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/api/login-view/${encodeURIComponent(view)}`,
-  paths: (path: string) => requestJSON<PathListing>(`/api/paths?path=${encodeURIComponent(path)}`),
-  pickPath: (path: string) =>
-    requestJSON<{ path: string }>(`/api/paths/pick?path=${encodeURIComponent(path)}`, {
-      method: 'POST',
-    }),
   refreshAccount: (id: string) =>
     requestJSON<AccountRefresh>(`/api/accounts/${encodeURIComponent(id)}/refresh`, {
       method: 'POST',
     }),
   startService: () => requestJSON<ServiceStatus>('/api/control/start', { method: 'POST' }),
   stopService: () => requestJSON<ServiceStatus>('/api/control/stop', { method: 'POST' }),
-  downloadCamoufox: () => requestJSON<ServiceStatus>('/api/camoufox/download', { method: 'POST' }),
   clearLogs: () => requestCommand('/api/logs', { method: 'DELETE' }),
   firstEventLatency: async () =>
     (await requestJSON<{ latencies: FirstEventLatency[] }>('/api/first-event-latency')).latencies,

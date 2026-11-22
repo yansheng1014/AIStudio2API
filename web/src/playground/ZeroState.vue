@@ -42,7 +42,6 @@ const heading = computed(() =>
       :starters="configStarters"
       :examples="config.examples"
       :docs="config.docs"
-      :caption="config.builtBy?.replace('{model}', currentModel!.name || config.family)"
       @starter="emit('starter', $event as ZeroStarter)"
       @example="emit('starter', $event as ZeroStarter)"
     />

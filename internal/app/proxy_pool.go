@@ -3,38 +3,37 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
-	"github.com/Mag1cFall/AIStudio2API/internal/api"
+	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
-	"github.com/Mag1cFall/AIStudio2API/internal/proxydial"
 )
 
 // proxyProbeInterval 为代理池的定时检测间隔
 const proxyProbeInterval = 5 * time.Minute
 
-// proxyProbeTarget 为代理检测建立隧道的地址
-const proxyProbeTarget = "aistudio.google.com:443"
+// proxyProbeTarget 为代理检测访问的地址
+const proxyProbeTarget = "https://aistudio.google.com/"
 
-// checkProxy 经代理建立到 AI Studio 的隧道，建立成功即判定代理可用
+// checkProxy 经代理访问 AI Studio，收到任意 HTTP 响应即判定代理可用
 func checkProxy(ctx context.Context, proxy string) error {
-	parsed, err := url.Parse(strings.TrimSpace(proxy))
+	client, err := aistudio.NewProxyHTTPClient(proxy)
 	if err != nil {
 		return err
 	}
-	dialer, err := proxydial.Dialer(parsed)
-	if err != nil {
-		return err
-	}
+	defer client.CloseIdleConnections()
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	connection, err := dialer.DialContext(ctx, "tcp", proxyProbeTarget)
+	request, _ := http.NewRequestWithContext(ctx, http.MethodGet, proxyProbeTarget, nil)
+	response, err := client.Do(request)
 	if err != nil {
 		return err
 	}
-	return connection.Close()
+	return response.Body.Close()
 }
 
 // proxyNetworkError 判断请求失败是否为经代理的网络错误
@@ -50,26 +49,11 @@ func proxyNetworkError(ctx context.Context, err error) bool {
 func (service *trackedService) reportProxyFailure(proxy string, label string, err error) {
 	changed, proxyErr := service.proxies.ReportFailure(proxy, err)
 	if proxyErr != nil {
-		service.requests.log(label, "WARN", "代理改绑失败", "error", proxyErr)
+		service.requests.log(label, "WARN", "代理改绑 | 错误="+proxyErr.Error())
 	}
 	if len(changed) > 0 && service.rebindAccounts != nil {
 		service.rebindAccounts(changed)
 	}
-}
-
-// probeProxyPool 在生成服务启动时检测多个代理，账户先改绑到可用代理再载入页面与预热 Worker
-func (service *trackedService) probeProxyPool(ctx context.Context) {
-	proxies := len(service.proxies.Status())
-	if proxies < 2 {
-		return
-	}
-	service.enterLaunchStep("probe_proxies")
-	service.requests.logStage("service", "INFO", api.LogStage{Name: "生成服务启动"}, "检测代理池", "proxies", proxies)
-	changed, err := service.proxies.Probe(ctx, checkProxy)
-	if err != nil && ctx.Err() == nil {
-		service.requests.log("service", "WARN", "代理改绑失败", "error", err)
-	}
-	service.rebindAccounts(changed)
 }
 
 // probeProxies 定时检测代理池并改绑不可用代理上的账户
@@ -84,7 +68,7 @@ func (admin *runtimeAdmin) probeProxies(ctx context.Context) {
 		}
 		changed, err := admin.proxies.Probe(ctx, checkProxy)
 		if err != nil && ctx.Err() == nil {
-			admin.requests.log("service", "WARN", "代理改绑失败", "error", err)
+			admin.requests.log("service", "WARN", "代理改绑 | 错误="+err.Error())
 		}
 		admin.rebindAccounts(changed)
 	}
@@ -98,7 +82,7 @@ func (admin *runtimeAdmin) rebindAccounts(accountIDs []string) {
 	go func() {
 		for _, accountID := range accountIDs {
 			if err := admin.rebindAccount(admin.lifecycle, accountID); err != nil && admin.lifecycle.Err() == nil {
-				admin.requests.log(accountID, "WARN", "代理改绑失败", "error", err)
+				admin.requests.log(accountID, "WARN", "代理改绑 | 错误="+err.Error())
 			}
 		}
 	}()
@@ -115,6 +99,6 @@ func (admin *runtimeAdmin) rebindAccount(ctx context.Context, accountID string) 
 		return errors.Join(err, lease.Release())
 	}
 	workerUpdate.Commit()
-	admin.requests.log(account.Config.Label, "WARN", "代理已改绑", "egress", redactedProxy(account.EffectiveProxy(admin.globalProxy)))
+	admin.requests.log(account.Config.Label, "WARN", fmt.Sprintf("代理改绑 | 出口=%s", redactedProxy(account.EffectiveProxy(admin.globalProxy))))
 	return lease.Release()
 }

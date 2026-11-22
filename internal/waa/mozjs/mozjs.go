@@ -103,14 +103,12 @@ type Options struct {
 	Locale    string
 }
 
-// Context 是绑定到创建它的 OS 线程的 JSContext，除 Interrupt 外只能在该线程上使用
+// Context 是绑定到创建它的 OS 线程的 JSContext，只能在该线程上使用
 type Context struct {
 	c       *C.mz_context
 	id      uintptr
 	natives []NativeFunc
-	// mu 使其他线程的 Interrupt 与销毁上下文互斥
-	mu     sync.Mutex
-	closed bool
+	closed  bool
 }
 
 var (
@@ -152,11 +150,13 @@ func NewContext(options Options) (*Context, error) {
 	return context, nil
 }
 
-// SetCamouLocale 设置当前线程 mozilla::intl::Locale 的默认区域为 Camoufox 的 navigator.language
-func SetCamouLocale(locale string) {
-	cLocale := C.CString(locale)
+// SetCamouLocale 设置当前线程 mozilla::intl::Locale 的 Camoufox 语言、地区与 navigator.language
+func SetCamouLocale(language, region, locale string) {
+	cLanguage, cRegion, cLocale := C.CString(language), C.CString(region), C.CString(locale)
+	defer C.free(unsafe.Pointer(cLanguage))
+	defer C.free(unsafe.Pointer(cRegion))
 	defer C.free(unsafe.Pointer(cLocale))
-	C.mz_set_camou_locale(cLocale)
+	C.mz_set_camou_locale(cLanguage, cRegion, cLocale)
 }
 
 // Now 返回单调时钟的毫秒数，精度为微秒
@@ -164,8 +164,6 @@ func Now() float64 { return float64(C.mz_now()) }
 
 // Close 销毁上下文
 func (cx *Context) Close() {
-	cx.mu.Lock()
-	defer cx.mu.Unlock()
 	if cx.closed {
 		return
 	}
@@ -379,14 +377,8 @@ func (cx *Context) SetThrowLocation(filename string, line, column int) {
 	C.mz_set_throw_location(cx.c, cName, C.uint32_t(line), C.uint32_t(column))
 }
 
-// Interrupt 请求终止正在执行的脚本，可在任意 goroutine 调用，上下文已销毁时不做任何事
-func (cx *Context) Interrupt() {
-	cx.mu.Lock()
-	defer cx.mu.Unlock()
-	if !cx.closed {
-		C.mz_request_interrupt(cx.c)
-	}
-}
+// Interrupt 请求终止正在执行的脚本，可在任意 goroutine 调用
+func (cx *Context) Interrupt() { C.mz_request_interrupt(cx.c) }
 
 // GC 执行一次完整 GC，保留 JIT 代码
 func (cx *Context) GC() { C.mz_gc(cx.c, false) }

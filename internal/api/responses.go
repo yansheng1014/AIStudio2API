@@ -10,10 +10,8 @@ import (
 	"maps"
 	"net/http"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
@@ -47,16 +45,6 @@ type responsesRequest struct {
 		Type             string `json:"type"`
 		CompactThreshold *int64 `json:"compact_threshold"`
 	} `json:"context_management"`
-	// split 是 prepareResponses 对 Input 的切分结果
-	split splitInput
-}
-
-// inputItems 返回 Input 的切分结果，prepareResponses 已切分同一输入时直接沿用
-func (request responsesRequest) inputItems() splitInput {
-	if bytes.Equal(request.split.raw, request.Input) {
-		return request.split
-	}
-	return splitResponsesInput(request.Input)
 }
 
 // compactThreshold 返回 context_management 中 compaction 的触发 token 数，没有时为 0
@@ -174,98 +162,54 @@ type responseHistory struct {
 	Agent     string
 }
 
-// StateStore 持久保存续接节点：Index 按保存顺序返回服务启动前保存的节点，Read 在访问时读出节点正文
+// StateStore 持久保存续接节点，服务重启后由 Load 按保存顺序读回
 type StateStore interface {
-	Index() []StateNode
-	Read(id string) ([]byte, bool)
+	Load() []SavedState
 	Save(saved []SavedState, removed []string)
-}
-
-// StateNode 是已保存续接节点的 ID 与续接起点
-type StateNode struct {
-	ID       string
-	ParentID string
 }
 
 // SavedState 是写入 StateStore 的一个续接节点
 type SavedState struct {
-	ID       string
-	ParentID string
-	Data     []byte
+	ID   string
+	Data []byte
 }
 
 type responseStateStore struct {
-	mu sync.Mutex
-	// states 是正文已载入内存的节点
-	states map[string]responseState
-	// parents 是全部节点的续接起点，正文还在 persist 中的节点也在其中
-	parents map[string]string
+	mu      sync.Mutex
+	states  map[string]responseState
 	order   []string
 	persist StateStore
-	// committed 在最近一次排队的写入提交完成时关闭，写入按排队顺序提交
-	committed chan struct{}
 }
 
-// newResponseStateStore 创建续接节点存储，persist 非空时读回其中保存的节点索引，正文在访问时载入，之后的变化写入 persist
+// newResponseStateStore 创建续接节点存储，persist 非空时读回其中保存的节点并把之后的变化写入它
 func newResponseStateStore(persist StateStore) *responseStateStore {
-	committed := make(chan struct{})
-	close(committed)
-	store := &responseStateStore{
-		states: make(map[string]responseState, responseStateCapacity), parents: make(map[string]string, responseStateCapacity),
-		persist: persist, committed: committed,
-	}
+	store := &responseStateStore{states: make(map[string]responseState, responseStateCapacity), persist: persist}
 	if persist == nil {
 		return store
 	}
-	for _, node := range persist.Index() {
-		store.parents[node.ID] = node.ParentID
-		store.order = append(store.order, node.ID)
+	for _, saved := range persist.Load() {
+		var state responseState
+		if json.Unmarshal(saved.Data, &state) == nil {
+			store.states[saved.ID] = state
+			store.order = append(store.order, saved.ID)
+		}
 	}
 	return store
 }
 
-// stateLocked 返回节点，正文还在 persist 中时读出并留在内存
-func (store *responseStateStore) stateLocked(id string) (responseState, bool) {
-	if state, exists := store.states[id]; exists {
-		return state, true
-	}
-	if _, exists := store.parents[id]; !exists {
-		return responseState{}, false
-	}
-	data, ok := store.persist.Read(id)
-	var state responseState
-	if !ok || json.Unmarshal(data, &state) != nil {
-		return responseState{}, false
-	}
-	store.states[id] = state
-	return state, true
-}
-
-// putLocked 保存节点并记录它的续接起点
-func (store *responseStateStore) putLocked(id string, state responseState) {
-	store.states[id] = state
-	store.parents[id] = state.ParentID
-}
-
-// persistLocked 编码仍存在且已结束的节点并排队删除已移除的节点，返回按排队顺序提交这次写入的函数，调用方释放 mu 后调用；进行中的后台响应与交互在服务重启后不能继续，只保存终态
-func (store *responseStateStore) persistLocked(saved, removed []string) func() {
+// persistLocked 把仍存在且已结束的节点写入 persist，并删除已移除的节点；进行中的后台响应与交互在服务重启后不能继续，只保存终态
+func (store *responseStateStore) persistLocked(saved, removed []string) {
 	if store.persist == nil {
-		return func() {}
+		return
 	}
 	states := make([]SavedState, 0, len(saved))
 	for _, id := range saved {
 		if state, exists := store.states[id]; exists && state.finished() {
 			data, _ := json.Marshal(state)
-			states = append(states, SavedState{ID: id, ParentID: state.ParentID, Data: data})
+			states = append(states, SavedState{ID: id, Data: data})
 		}
 	}
-	previous, done := store.committed, make(chan struct{})
-	store.committed = done
-	return func() {
-		<-previous
-		store.persist.Save(states, removed)
-		close(done)
-	}
+	store.persist.Save(states, removed)
 }
 
 // finished 返回节点的响应或交互是否已不在进行中
@@ -288,7 +232,7 @@ func (store *responseStateStore) Load(id string) (responseHistory, bool) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	history := responseHistory{ID: id, Contents: make([]aistudio.Content, 0), InlineInstructions: make([]string, 0)}
-	if state, exists := store.stateLocked(id); exists {
+	if state, exists := store.states[id]; exists {
 		history.Interaction = state.Interaction != nil
 		if state.Interaction != nil {
 			history.Upstream, history.AccountID, history.Agent = state.Interaction.upstream, state.Interaction.account, state.Interaction.agent
@@ -299,7 +243,7 @@ func (store *responseStateStore) Load(id string) (responseHistory, bool) {
 	}
 	chain := make([]responseState, 0)
 	for id != "" {
-		state, exists := store.stateLocked(id)
+		state, exists := store.states[id]
 		if !exists {
 			return responseHistory{}, false
 		}
@@ -325,7 +269,8 @@ func (store *responseStateStore) Store(id string, previous responseHistory, resu
 	}
 	state.InlineInstructions = append([]string(nil), state.InlineInstructions...)
 	store.mu.Lock()
-	if _, exists := store.parents[previous.ID]; previous.ID != "" && !exists {
+	defer store.mu.Unlock()
+	if _, exists := store.states[previous.ID]; previous.ID != "" && !exists {
 		state.ParentID = ""
 		state.Contents = append(cloneResponseContents(previous.Contents), state.Contents...)
 		state.InlineInstructions = append(append([]string(nil), previous.InlineInstructions...), state.InlineInstructions...)
@@ -333,10 +278,10 @@ func (store *responseStateStore) Store(id string, previous responseHistory, resu
 			state.Record.Input = append(append([]storedItem(nil), previous.Items...), state.Record.Input...)
 		}
 	}
-	if _, exists := store.parents[id]; !exists {
+	if _, exists := store.states[id]; !exists {
 		store.order = append(store.order, id)
 	}
-	store.putLocked(id, state)
+	store.states[id] = state
 	saved, removed := []string{id}, []string(nil)
 	for len(store.order) > responseStateCapacity {
 		evicted := store.order[0]
@@ -344,20 +289,17 @@ func (store *responseStateStore) Store(id string, previous responseHistory, resu
 		saved = append(saved, store.removeLocked(evicted)...)
 		removed = append(removed, evicted)
 	}
-	commit := store.persistLocked(saved, removed)
-	store.mu.Unlock()
-	commit()
+	store.persistLocked(saved, removed)
 }
 
 // removeLocked 删除一个节点，并把它的上下文并入以它为续接起点的子节点，返回这些子节点的 ID
 func (store *responseStateStore) removeLocked(id string) []string {
-	parent, _ := store.stateLocked(id)
+	parent := store.states[id]
 	var children []string
-	for childID, parentID := range store.parents {
-		if parentID != id {
+	for childID, child := range store.states {
+		if child.ParentID != id {
 			continue
 		}
-		child, _ := store.stateLocked(childID)
 		child.ParentID = parent.ParentID
 		child.Contents = append(cloneResponseContents(parent.Contents), child.Contents...)
 		child.InlineInstructions = append(append([]string(nil), parent.InlineInstructions...), child.InlineInstructions...)
@@ -366,11 +308,10 @@ func (store *responseStateStore) removeLocked(id string) []string {
 			merged.Input = append(append(append([]storedItem(nil), parent.Record.Input...), parent.Record.Output...), child.Record.Input...)
 			child.Record = &merged
 		}
-		store.putLocked(childID, child)
+		store.states[childID] = child
 		children = append(children, childID)
 	}
 	delete(store.states, id)
-	delete(store.parents, id)
 	return children
 }
 
@@ -378,7 +319,7 @@ func (store *responseStateStore) removeLocked(id string) []string {
 func (store *responseStateStore) Response(id string, include []string) (json.RawMessage, bool, bool) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	state, exists := store.stateLocked(id)
+	state, exists := store.states[id]
 	if !exists || state.Record == nil {
 		return nil, false, false
 	}
@@ -400,7 +341,7 @@ func (store *responseStateStore) Response(id string, include []string) (json.Raw
 func (store *responseStateStore) Stream(id string) (*streamLog, bool) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	state, exists := store.stateLocked(id)
+	state, exists := store.states[id]
 	if !exists || state.Record == nil || state.Record.Stream == nil {
 		return nil, false
 	}
@@ -411,21 +352,21 @@ func (store *responseStateStore) Stream(id string) (*streamLog, bool) {
 func (store *responseStateStore) Interaction(id string) (*interactionRecord, bool) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	state, _ := store.stateLocked(id)
-	return state.Interaction, state.Interaction != nil
+	interaction := store.states[id].Interaction
+	return interaction, interaction != nil
 }
 
 // InputItems 返回生成该响应时的全部输入项：续接链上各前序响应的输入与输出，以及本次输入
 func (store *responseStateStore) InputItems(id string) ([]storedItem, bool) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	state, exists := store.stateLocked(id)
+	state, exists := store.states[id]
 	if !exists || state.Record == nil {
 		return nil, false
 	}
 	items := append([]storedItem(nil), state.Record.Input...)
 	for parentID := state.ParentID; parentID != ""; {
-		parent, _ := store.stateLocked(parentID)
+		parent := store.states[parentID]
 		if parent.Record != nil {
 			items = append(append(append([]storedItem(nil), parent.Record.Input...), parent.Record.Output...), items...)
 		}
@@ -437,32 +378,35 @@ func (store *responseStateStore) InputItems(id string) ([]storedItem, bool) {
 // Delete 删除 Responses 接口保存的响应，interaction 为 true 时删除 Interactions 接口保存的交互，以它为起点的续接保留完整上下文
 func (store *responseStateStore) Delete(id string, interaction bool) bool {
 	store.mu.Lock()
-	if state, exists := store.stateLocked(id); !exists || (state.Interaction != nil) != interaction {
-		store.mu.Unlock()
+	defer store.mu.Unlock()
+	if state, exists := store.states[id]; !exists || (state.Interaction != nil) != interaction {
 		return false
 	}
-	commit := store.persistLocked(store.removeLocked(id), []string{id})
+	store.persistLocked(store.removeLocked(id), []string{id})
 	store.order = slices.DeleteFunc(store.order, func(value string) bool { return value == id })
-	store.mu.Unlock()
-	commit()
 	return true
 }
 
 // ResolveItems 将输入中的 item_reference 替换为已保存的同 ID 输入或输出项
-func (store *responseStateStore) ResolveItems(input splitInput) (splitInput, error) {
-	if !slices.ContainsFunc(input.heads, responsesItemHead.reference) {
-		return input, nil
+func (store *responseStateStore) ResolveItems(raw json.RawMessage) (json.RawMessage, error) {
+	var items []json.RawMessage
+	if json.Unmarshal(raw, &items) != nil {
+		return raw, nil
 	}
-	items := slices.Clone(input.items)
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	for index, head := range input.heads {
-		if !head.reference() {
+	resolved := false
+	for index, item := range items {
+		var head struct {
+			Type string `json:"type"`
+			Role string `json:"role"`
+			ID   string `json:"id"`
+		}
+		if json.Unmarshal(item, &head) != nil || head.Type != "item_reference" && (head.Type != "" || head.Role != "" || head.ID == "") {
 			continue
 		}
 		found := false
-		for stateID := range store.parents {
-			state, _ := store.stateLocked(stateID)
+		for _, state := range store.states {
 			if state.Record == nil {
 				continue
 			}
@@ -477,62 +421,14 @@ func (store *responseStateStore) ResolveItems(input splitInput) (splitInput, err
 			}
 		}
 		if !found {
-			return splitInput{}, fmt.Errorf("item %q was not found", head.ID)
+			return nil, fmt.Errorf("item %q was not found", head.ID)
 		}
+		resolved = true
 	}
-	encoded, err := json.Marshal(items)
-	if err != nil {
-		return splitInput{}, err
+	if !resolved {
+		return raw, nil
 	}
-	return splitResponsesInput(encoded), nil
-}
-
-// responsesItemHead 是输入项的类型、角色与 ID
-type responsesItemHead struct {
-	Type string `json:"type"`
-	Role string `json:"role"`
-	ID   string `json:"id"`
-	// invalid 表示该项不能完整解析为类型、角色与 ID
-	invalid bool
-}
-
-// reference 返回输入项是否引用已保存的项：item_reference 或只带 ID 的项
-func (head responsesItemHead) reference() bool {
-	return !head.invalid && (head.Type == "item_reference" || head.Type == "" && head.Role == "" && head.ID != "")
-}
-
-// splitInput 是切分一次的 Responses 输入：array 表示原文是数组，items 与 heads 按位置对应
-type splitInput struct {
-	raw   json.RawMessage
-	array bool
-	items []json.RawMessage
-	heads []responsesItemHead
-}
-
-// splitResponsesInput 把 Responses 输入切分为各输入项原文与类型、角色和 ID
-func splitResponsesInput(raw json.RawMessage) splitInput {
-	input := splitInput{raw: raw}
-	if json.Unmarshal(raw, &input.items) != nil {
-		input.items = nil
-		return input
-	}
-	input.array = true
-	input.heads = responsesItemHeads(input.items)
-	return input
-}
-
-// responsesItemHeads 返回各输入项的类型、角色与 ID
-func responsesItemHeads(items []json.RawMessage) []responsesItemHead {
-	heads := make([]responsesItemHead, len(items))
-	for index, item := range items {
-		heads[index].invalid = json.Unmarshal(item, &heads[index]) != nil
-	}
-	return heads
-}
-
-// hasType 返回输入中是否有 kinds 中任一类型的项
-func (input splitInput) hasType(kinds ...string) bool {
-	return slices.ContainsFunc(input.heads, func(head responsesItemHead) bool { return slices.Contains(kinds, head.Type) })
+	return json.Marshal(items)
 }
 
 func cloneResponseContents(contents []aistudio.Content) []aistudio.Content {
@@ -565,7 +461,7 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if responsesCompactionTrigger(request.inputItems()) {
+	if responsesCompactionTrigger(request.Input) {
 		s.handleCompactionTrigger(w, r, request, prepared, responseID)
 		return
 	}
@@ -704,7 +600,7 @@ func (s *server) compactOverThreshold(ctx context.Context, request *responsesReq
 
 // prepareResponses 展开 item_reference、转换请求、下载外部媒体并接上 previous_response_id 的上下文；execute 为真时执行输入中批准的 MCP 调用
 func (s *server) prepareResponses(ctx context.Context, request *responsesRequest, id string, execute bool) (responsesPreparation, error) {
-	input, err := s.responseStates.ResolveItems(splitResponsesInput(request.Input))
+	input, err := s.responseStates.ResolveItems(request.Input)
 	if err != nil {
 		return responsesPreparation{}, err
 	}
@@ -716,14 +612,11 @@ func (s *server) prepareResponses(ctx context.Context, request *responsesRequest
 	}
 	additionalTools, _ := responsesInputConfig(input)
 	tools := slices.Concat(request.Tools, additionalTools)
-	rewritten, approved, err := s.applyMCPApprovals(ctx, request.PreviousResponseID, tools, input.raw, execute)
+	rewritten, approved, err := s.applyMCPApprovals(ctx, request.PreviousResponseID, tools, input, execute)
 	if err != nil {
 		return responsesPreparation{}, err
 	}
-	request.Input, request.split = rewritten, input
-	if !bytes.Equal(rewritten, input.raw) {
-		request.split = splitResponsesInput(rewritten)
-	}
+	request.Input = rewritten
 	generateRequest, inlineInstructions, err := request.toGenerateRequest(id)
 	if err == nil {
 		generateRequest, err = s.resolveMCPTools(ctx, generateRequest)
@@ -756,10 +649,7 @@ func (s *server) prepareResponses(ctx context.Context, request *responsesRequest
 	}
 	prepared := responsesPreparation{
 		generate: generateRequest, contents: cloneResponseContents(generateRequest.Contents),
-		inlineInstructions: append([]string(nil), inlineInstructions...), approved: approved,
-	}
-	if request.storesResponse() {
-		prepared.input = responsesInputItems(input, id)
+		inlineInstructions: append([]string(nil), inlineInstructions...), input: responsesInputItems(input, id), approved: approved,
 	}
 	if tool := imageGenerationTool(request.Tools); tool != nil && tool.InputImageMask != nil {
 		mask, err := s.imageGenerationMask(ctx, *tool.InputImageMask)
@@ -820,15 +710,15 @@ func (s *server) storeResponse(id string, request responsesRequest, prepared res
 }
 
 // responsesInputItems 把请求输入整理为带 ID 的输入项：字符串输入与字符串内容转为内容数组，缺少 ID 的项按位置编号
-func responsesInputItems(input splitInput, responseID string) []storedItem {
-	items := input.items
-	if !input.array {
-		var text string
-		if json.Unmarshal(input.raw, &text) != nil {
-			return nil
-		}
-		encoded, _ := json.Marshal(map[string]string{"role": "user", "content": text})
-		items = []json.RawMessage{encoded}
+func responsesInputItems(raw json.RawMessage, responseID string) []storedItem {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		encoded, _ := json.Marshal([]map[string]string{{"role": "user", "content": text}})
+		raw = encoded
+	}
+	var items []json.RawMessage
+	if json.Unmarshal(raw, &items) != nil {
+		return nil
 	}
 	stored := make([]storedItem, 0, len(items))
 	for index, rawItem := range items {
@@ -884,13 +774,12 @@ func (request responsesRequest) toGenerateRequest(id string) (aistudio.GenerateR
 	default:
 		return aistudio.GenerateRequest{}, nil, fmt.Errorf("unsupported truncation %q", request.Truncation)
 	}
-	input := request.inputItems()
-	contents, inlineInstructions, err := responsesContents(input)
+	contents, inlineInstructions, err := responsesContents(request.Input)
 	if err != nil {
 		return aistudio.GenerateRequest{}, nil, err
 	}
 	instructions := request.instructions(inlineInstructions)
-	additionalTools, configuredEffort := responsesInputConfig(input)
+	additionalTools, configuredEffort := responsesInputConfig(request.Input)
 	tools, err := mapResponsesTools(slices.Concat(request.Tools, additionalTools), request.ToolChoice)
 	if err != nil {
 		return aistudio.GenerateRequest{}, nil, err
@@ -983,33 +872,30 @@ func (request responsesRequest) toGenerateRequest(id string) (aistudio.GenerateR
 	}, inlineInstructions, nil
 }
 
-func responsesContents(input splitInput) ([]aistudio.Content, []string, error) {
-	if !rawJSONConfigured(input.raw) {
+func responsesContents(raw json.RawMessage) ([]aistudio.Content, []string, error) {
+	if !rawJSONConfigured(raw) {
 		return nil, nil, nil
 	}
-	if !input.array {
-		var text string
-		if err := json.Unmarshal(input.raw, &text); err != nil {
-			return nil, nil, fmt.Errorf("input must be a string or item array")
-		}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
 		return []aistudio.Content{{Role: aistudio.RoleUser, Parts: []aistudio.Part{{Text: text}}}}, nil, nil
 	}
-	items, heads := input.items, input.heads
-	if input.hasType("compaction") {
-		window, err := splitCompaction(items)
-		if err != nil {
-			return nil, nil, err
-		}
-		items = window.items()
-		heads = responsesItemHeads(items)
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil, nil, fmt.Errorf("input must be a string or item array")
 	}
+	window, err := splitCompaction(items)
+	if err != nil {
+		return nil, nil, err
+	}
+	items = window.items()
 	contents := make([]aistudio.Content, 0, len(items))
 	var instructions []string
 	var systemMedia []aistudio.Part
 	pendingSignature := ""
 	for index, rawItem := range items {
 		var item responsesInputItem
-		switch kind := heads[index].Type; kind {
+		switch kind := responsesItemType(rawItem); kind {
 		case "compaction_trigger":
 			if index != len(items)-1 {
 				return nil, nil, fmt.Errorf("compaction_trigger must be the final input item")
@@ -1031,7 +917,9 @@ func responsesContents(input splitInput) ([]aistudio.Content, []string, error) {
 				return nil, nil, fmt.Errorf("input item: %w", err)
 			}
 		}
-		item.Name = namespacedName(item.Namespace, item.Name)
+		if item.Namespace != "" {
+			item.Name = item.Namespace + "." + item.Name
+		}
 		call := aistudio.FunctionCall{ID: item.CallID, Name: item.Name, ThoughtSignature: pendingSignature}
 		switch item.Type {
 		case "", "message":
@@ -1062,14 +950,6 @@ func responsesContents(input splitInput) ([]aistudio.Content, []string, error) {
 				return nil, nil, err
 			}
 			contents = append(contents, aistudio.Content{Role: role, Parts: parts})
-			continue
-		case "agent_message":
-			pendingSignature = ""
-			parts, err := agentMessageParts(item.Content)
-			if err != nil {
-				return nil, nil, fmt.Errorf("agent_message: %w", err)
-			}
-			contents = append(contents, aistudio.Content{Role: aistudio.RoleUser, Parts: parts})
 			continue
 		case "function_call":
 			call.Arguments = functionCallArguments(item.Arguments)
@@ -1124,35 +1004,8 @@ func responsesContents(input splitInput) ([]aistudio.Content, []string, error) {
 	return prependSystemMedia(contents, systemMedia), instructions, nil
 }
 
-// agentMessageParts 把 Codex 智能体间消息的内容转为文本片段，encrypted_content 中是本服务模型写出的消息原文
-func agentMessageParts(raw json.RawMessage) ([]aistudio.Part, error) {
-	var content []struct {
-		Type             string `json:"type"`
-		Text             string `json:"text"`
-		EncryptedContent string `json:"encrypted_content"`
-	}
-	if err := json.Unmarshal(raw, &content); err != nil {
-		return nil, err
-	}
-	parts := make([]aistudio.Part, 0, len(content))
-	for _, part := range content {
-		switch part.Type {
-		case "input_text":
-			parts = append(parts, aistudio.Part{Text: part.Text})
-		case "encrypted_content":
-			parts = append(parts, aistudio.Part{Text: part.EncryptedContent})
-		default:
-			return nil, fmt.Errorf("unsupported content type %q", part.Type)
-		}
-	}
-	return parts, nil
-}
-
 // responsesInputConfig 返回输入项中 additional_tools 提供的工具与最后一个 configuration_update 的推理强度
-func responsesInputConfig(input splitInput) ([]responsesTool, string) {
-	if !input.hasType("additional_tools", "configuration_update") {
-		return nil, ""
-	}
+func responsesInputConfig(raw json.RawMessage) ([]responsesTool, string) {
 	var items []struct {
 		Type      string          `json:"type"`
 		Tools     []responsesTool `json:"tools"`
@@ -1160,7 +1013,7 @@ func responsesInputConfig(input splitInput) ([]responsesTool, string) {
 			Effort string `json:"effort"`
 		} `json:"reasoning"`
 	}
-	if json.Unmarshal(input.raw, &items) != nil {
+	if json.Unmarshal(raw, &items) != nil {
 		return nil, ""
 	}
 	var tools []responsesTool
@@ -1201,7 +1054,7 @@ func responsesHostedItem(kind string, raw json.RawMessage) (aistudio.Content, er
 			if err != nil {
 				return aistudio.Content{}, fmt.Errorf("result: %w", err)
 			}
-			media = append(media, aistudio.Part{InlineData: aistudio.NewBlob(detectMediaType("", data), data)})
+			media = append(media, aistudio.Part{InlineData: &aistudio.Blob{MIME: detectMediaType("", data), Data: data}})
 			delete(item, "result")
 		}
 	case "mcp_approval_response":
@@ -1364,7 +1217,7 @@ func mapResponsesTools(tools []responsesTool, choice json.RawMessage) (aistudio.
 				if inner.Type != "function" && inner.Type != "custom" {
 					return aistudio.Tools{}, fmt.Errorf("namespace %q tool type %q is not supported", tool.Name, inner.Type)
 				}
-				inner.Name = namespacedName(tool.Name, inner.Name)
+				inner.Name = tool.Name + "." + inner.Name
 				if tool.Description != "" {
 					inner.Description = strings.TrimSpace(tool.Description + "\n\n" + inner.Description)
 				}
@@ -1572,14 +1425,6 @@ func responseFunctionCall(call aistudio.FunctionCall, tools []responsesTool) map
 	return item
 }
 
-// namespacedName 返回命名空间中函数的声明名：默认命名空间 functions 中的函数与顶层函数相同，用原名，其余为 <命名空间>.<名>
-func namespacedName(namespace, name string) string {
-	if namespace == "" || namespace == "functions" {
-		return name
-	}
-	return namespace + "." + name
-}
-
 // responsesNamespace 返回函数所属的命名空间工具名
 func responsesNamespace(tools []responsesTool, name string) string {
 	for _, tool := range tools {
@@ -1587,7 +1432,7 @@ func responsesNamespace(tools []responsesTool, name string) string {
 			continue
 		}
 		for _, inner := range tool.Tools {
-			if namespacedName(tool.Name, inner.Name) == name {
+			if tool.Name+"."+inner.Name == name {
 				return tool.Name
 			}
 		}
@@ -1856,7 +1701,7 @@ func (o *responsesOutput) annotate(message map[string]any, final bool) []any {
 // responsesStreamWriter 把规范事件写成 Responses 流；w 为空时只累积输出项，非流式响应由它生成与流式相同的 output
 type responsesStreamWriter struct {
 	w        http.ResponseWriter
-	sequence atomic.Int64
+	sequence int
 	id       string
 	created  int64
 	request  responsesRequest
@@ -1879,7 +1724,7 @@ func outputPrefix(compaction map[string]any, prepared responsesPreparation) []ma
 
 // newResponsesWriter 返回 Responses 输出写出器
 func newResponsesWriter(w http.ResponseWriter, id string, created int64, request responsesRequest) *responsesStreamWriter {
-	additional, _ := responsesInputConfig(request.inputItems())
+	additional, _ := responsesInputConfig(request.Input)
 	return &responsesStreamWriter{
 		w: w, id: id, created: created, request: request,
 		output: &responsesOutput{
@@ -1902,7 +1747,6 @@ func (s *server) streamResponses(w http.ResponseWriter, r *http.Request, request
 	if err := writer.emit("response.in_progress", map[string]any{"response": responseShell(id, created, "in_progress", request)}); err != nil {
 		return
 	}
-	stream.setFrame(writer.progressFrame)
 	_ = s.streamOutput(r.Context(), writer, prepared, events, compaction, func(err error) bool { return shouldWriteRequestError(r, err) })
 }
 
@@ -1946,13 +1790,6 @@ func (s *server) streamOutput(ctx context.Context, writer *responsesStreamWriter
 	return nil
 }
 
-// progressFrame 返回流静默时重发的 response.in_progress 帧，序号与其他事件连续递增，外壳不回显请求字段
-func (writer *responsesStreamWriter) progressFrame() string {
-	shell := responseShell(writer.id, writer.created, "in_progress", responsesRequest{Model: writer.request.Model})
-	data, _ := json.Marshal(officialOrder("responses", map[string]any{"type": "response.in_progress", "sequence_number": writer.sequence.Add(1) - 1, "response": shell}))
-	return "event: response.in_progress\ndata: " + string(data) + "\n\n"
-}
-
 func (writer *responsesStreamWriter) emit(eventType string, payload map[string]any) error {
 	if item, ok := payload["item"].(map[string]any); ok {
 		payload["item"] = responseIncludeView(item, writer.request.Include)
@@ -1961,25 +1798,12 @@ func (writer *responsesStreamWriter) emit(eventType string, payload map[string]a
 		payload["response"] = responseView(response, writer.request.Include)
 	}
 	payload["type"] = eventType
-	payload["sequence_number"] = writer.sequence.Add(1) - 1
+	payload["sequence_number"] = writer.sequence
+	writer.sequence++
 	if writer.w == nil {
 		return nil
 	}
 	return writeSSE(writer.w, eventType, officialOrder("responses", payload))
-}
-
-// textDelta 写出正文的 response.output_text.delta 事件，字节与按官方字段顺序编码的同一事件相同
-func (writer *responsesStreamWriter) textDelta(text string) error {
-	sequence := writer.sequence.Add(1) - 1
-	if writer.w == nil {
-		return nil
-	}
-	frame := sseFrameStart("response.output_text.delta", 192+len(text))
-	frame = appendJSONString(append(frame, `{"type":"response.output_text.delta","item_id":`...), writer.output.message["id"].(string))
-	frame = strconv.AppendInt(append(frame, `,"output_index":`...), int64(writer.index(writer.output.message)), 10)
-	frame = appendJSONString(append(frame, `,"content_index":0,"delta":`...), text)
-	frame = strconv.AppendInt(append(frame, `,"sequence_number":`...), sequence, 10)
-	return writeSSEFrame(writer.w, append(frame, `,"logprobs":[]}`+"\n\n"...))
 }
 
 // index 返回输出项在响应 output 中的位置
@@ -2019,7 +1843,9 @@ func (writer *responsesStreamWriter) live(event aistudio.Event) error {
 			"item_id": writer.output.reasoning["id"], "output_index": writer.index(writer.output.reasoning), "summary_index": 0, "delta": event.Text,
 		})
 	case aistudio.EventText:
-		return writer.textDelta(event.Text)
+		return writer.emit("response.output_text.delta", map[string]any{
+			"item_id": writer.output.message["id"], "output_index": writer.index(writer.output.message), "content_index": 0, "delta": event.Text, "logprobs": []any{},
+		})
 	case aistudio.EventGrounding:
 		return writer.finishSearches()
 	case aistudio.EventCodeExecutionResult:
@@ -2313,17 +2139,12 @@ func (writer *responsesStreamWriter) terminal(response map[string]any) error {
 	return writer.emit(eventType, map[string]any{"response": response})
 }
 
-// failed 发送 response.failed：output 为已写出的输出项，error 按 responsesError
+// failed 发送 response.failed：output 为已写出的输出项，error.code 取 Responses 错误枚举
 func (writer *responsesStreamWriter) failed(err error) error {
 	response := responseShell(writer.id, writer.created, "failed", writer.request)
 	response["output"] = writer.items()
-	response["error"] = responsesError(err)
+	response["error"] = map[string]any{"code": responsesErrorCode(err), "message": publicErrorMessage(statusFromError(err), err.Error())}
 	return writer.emit("response.failed", map[string]any{"response": response})
-}
-
-// responsesError 返回 Responses 失败对象的 error 字段：code 取 Responses 错误枚举，可重试时消息末尾写明重试时间
-func responsesError(err error) map[string]any {
-	return map[string]any{"code": responsesErrorCode(err), "message": retryMessage(publicErrorMessage(statusFromError(err), publicReason(err)), retryAfterSeconds(err))}
 }
 
 // responsesErrorCode 返回 Responses 错误对象的官方枚举 code

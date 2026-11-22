@@ -16,10 +16,12 @@ withDefaults(
   defineProps<{
     icon: IconName
     label: string
+    tooltip?: string | undefined
+    chip?: boolean
     disabled?: boolean
     multiple?: boolean
   }>(),
-  { disabled: false, multiple: false },
+  { tooltip: undefined, chip: false, disabled: false, multiple: false },
 )
 const emit = defineEmits<{ images: [images: File[]] }>()
 const { t } = useI18n()
@@ -45,10 +47,12 @@ function onCapture(photo: Blob): void {
   <DropdownMenuRoot>
     <DropdownMenuTrigger as-child :disabled="disabled">
       <button
-        v-tooltip.below="label"
+        v-tooltip.below="tooltip ?? label"
         type="button"
         ms-button
-        class="ms-button-primary ms-button-icon add-icon"
+        :class="
+          chip ? 'ms-button-filter-chip add-chip' : 'ms-button-primary ms-button-icon add-icon'
+        "
         :aria-label="label"
         :aria-disabled="disabled"
       >
@@ -82,6 +86,13 @@ function onCapture(photo: Blob): void {
 <style scoped>
 .file-input {
   display: none;
+}
+
+.add-chip {
+  width: 32px;
+  padding: 8px 6px;
+  border-color: var(--color-v3-outline);
+  background: transparent;
 }
 
 .add-icon {

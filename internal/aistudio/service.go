@@ -26,8 +26,6 @@ type PooledService struct {
 	BuildNativeNonstream bool
 	// YouTubeLinks 把 user 文本中的 YouTube 链接作为视频外部媒体发送
 	YouTubeLinks bool
-	// DiscoverHiddenModels 让同步账户目录时探测官网前端已配置、ListModels 尚未列出的模型
-	DiscoverHiddenModels bool
 	// StripThoughtSignatures 发送前去掉对话历史中的思考签名
 	StripThoughtSignatures bool
 	// ContinuationRewrite 改写不接受以 model 轮结尾请求的模型的末尾 assistant 轮
@@ -102,76 +100,63 @@ func NewWorkerProtectedTransport(options WorkerProtectedTransportOptions) *Worke
 	}
 }
 
-// DoProtected 写入 fresh proof 后经账户的 WAA 运行时发送 GenerateContent、Build 代理或写代码助手请求，binding 与写入页面输入框的提示词取自关联函数结果后的 contents，页面提示词为最后一个轮次的文本；账户页面再次运行同一对话的 GenerateContent 按官网 Rerun 不写入提示词
+// DoProtected 写入 fresh proof 后经账户的 WAA 运行时发送 GenerateContent、Build 代理或写代码助手请求，写入页面输入框的提示词为最后一个轮次的文本；账户页面再次运行同一对话的 GenerateContent 按官网 Rerun 不写入提示词
 func (t *WorkerProtectedTransport) DoProtected(ctx context.Context, request GenerateRequest, rpc RPCRequest) (*RPCResponse, error) {
-	contents, err := linkedContents(request.Contents)
-	if err != nil {
-		return nil, err
-	}
 	var prompt string
+	var err error
+	proofField := 5
 	switch rpc.Method {
 	case buildProxyStreamedMethod, buildProxyUnaryMethod:
 		prompt, err = buildBindingPrompt(rpc.Body)
+		proofField = buildProofField
+	case assistantOfflineMethod:
+		prompt, err = bindingPrompt(request)
+		proofField = assistantProofField
 	default:
-		prompt, err = bindingPrompt(GenerateRequest{Contents: contents})
+		prompt, err = bindingPrompt(request)
 	}
 	if err != nil {
 		return nil, err
 	}
-	page := contentsText(contents[max(len(contents)-1, 0):])
-	if lease, ok := AccountLeaseFromContext(ctx); ok && rpc.Method == "GenerateContent" && t.runs.rerun(lease.Account().ID, request.turnChain.tipOf(request.Contents)) {
+	page := contentsText(request.Contents[max(len(request.Contents)-1, 0):])
+	if lease, ok := AccountLeaseFromContext(ctx); ok && rpc.Method == "GenerateContent" && t.runs.rerun(lease.Account().ID, request.Contents) {
 		page = ""
-		rounds := 0
-		for _, content := range request.Contents {
-			if content.Role == RoleUser {
-				rounds++
-			}
-		}
-		ctx = context.WithValue(ctx, pageRerunKey{}, rounds)
 	}
 	modelID := strings.TrimPrefix(strings.TrimSpace(request.Model), "models/")
-	if rpc.Method == "GenerateContent" {
-		ctx = context.WithValue(ctx, pageModelKey{}, modelID)
-	}
-	return t.doPrepared(ctx, prompt, page, request.continuationProof, AccountSelection{
+	return t.doPrepared(ctx, prompt, page, proofField, AccountSelection{
 		ModelID: modelID, Method: "generateContent", AccountID: strings.TrimSpace(request.AccountID),
 	}, rpc)
 }
 
-// doPrepared 为请求取得 proof 后经账户的 WAA 运行时发送，proof 写在 rpc.ProofAt 处，并写回运行时导出的 Cookie；proof 非空时写入该 proof；准备结果没有 proof 时由页面应用在界面运行中取 proof 并构造请求头，不签 Authorization，等待响应头的阶段由运行时在页面发出后报告
+// doPrepared 为请求写入 proof 后经账户的 WAA 运行时发送，并写回运行时导出的 Cookie
 func (t *WorkerProtectedTransport) doPrepared(
 	ctx context.Context,
 	prompt string,
 	page string,
-	proof string,
+	proofField int,
 	selection AccountSelection,
 	rpc RPCRequest,
 ) (*RPCResponse, error) {
-	lease, worker, rpc, prepared, err := t.prepareProtectedRequest(ctx, prompt, page, proof, selection, rpc)
+	lease, worker, rpc, err := t.prepareProtectedRequest(ctx, prompt, page, proofField, selection, rpc)
 	if err != nil {
 		return nil, err
 	}
-	headers := rpc.Header
-	if prepared.Proof != "" {
-		browserState, err := worker.BrowserStorageState(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("读取浏览器 Cookie: %w", err)
-		}
-		authorization, err := t.transport.signer.Authorization(browserState)
-		if err != nil {
-			return nil, err
-		}
-		headers = rpc.Header.Clone()
-		headers.Set("Authorization", authorization)
+	browserState, err := worker.BrowserStorageState(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("读取浏览器 Cookie: %w", err)
 	}
+	authorization, err := t.transport.signer.Authorization(browserState)
+	if err != nil {
+		return nil, err
+	}
+	headers := rpc.Header.Clone()
+	headers.Set("Authorization", authorization)
 	if lease.CoolingDown(selectionAccessScope(selection)) {
 		return nil, ErrAccountCoolingDown
 	}
-	if prepared.Proof != "" {
-		reportRequestPhase(ctx, RequestPhaseSendingUpstream)
-	}
+	reportRequestPhase(ctx, RequestPhaseSendingUpstream)
 	response, err := worker.SendProtected(ctx, ProtectedRequest{
-		URL: rpc.URL, Headers: headers, Body: rpc.Body, ProofAt: rpc.ProofAt, Prompt: prompt, PagePrompt: prepared.PagePrompt, Proof: prepared.Proof,
+		URL: rpc.URL, Headers: headers, Body: rpc.Body, Prompt: prompt, PagePrompt: page, ProofField: proofField,
 	})
 	if err != nil {
 		return nil, err
@@ -211,34 +196,35 @@ func (t *WorkerProtectedTransport) prepareProtectedRequest(
 	ctx context.Context,
 	prompt string,
 	page string,
-	proof string,
+	proofField int,
 	selection AccountSelection,
 	rpc RPCRequest,
-) (*AccountLease, ProtectedPreparer, RPCRequest, PreparedProtectedRequest, error) {
+) (*AccountLease, ProtectedPreparer, RPCRequest, error) {
 	lease, ok := AccountLeaseFromContext(ctx)
 	if !ok {
-		return nil, nil, RPCRequest{}, PreparedProtectedRequest{}, fmt.Errorf("受保护请求缺少账户租约")
+		return nil, nil, RPCRequest{}, fmt.Errorf("受保护请求缺少账户租约")
 	}
 	if err := validateLeaseSelection(lease, selection); err != nil {
-		return nil, nil, RPCRequest{}, PreparedProtectedRequest{}, err
+		return nil, nil, RPCRequest{}, err
 	}
 	worker, err := t.workers.Worker(ctx, lease.Account().ID, selection.ModelID)
 	if err != nil {
-		return nil, nil, RPCRequest{}, PreparedProtectedRequest{}, fmt.Errorf("获取账户 WAA preparer: %w", err)
+		return nil, nil, RPCRequest{}, fmt.Errorf("获取账户 WAA preparer: %w", err)
 	}
 	reportRequestPhase(ctx, RequestPhasePreparingWAA)
 	prepared, err := worker.Prepare(ctx, ProtectedRequest{
-		URL: rpc.URL, Headers: rpc.Header.Clone(), Body: rpc.Body, ProofAt: rpc.ProofAt,
-		Prompt: prompt, PagePrompt: page, Proof: proof,
+		URL: rpc.URL, Headers: rpc.Header.Clone(), Body: rpc.Body,
+		Prompt: prompt, PagePrompt: page, ProofField: proofField,
 	})
 	if err != nil {
-		return nil, nil, RPCRequest{}, PreparedProtectedRequest{}, fmt.Errorf("准备 fresh WAA proof: %w", err)
+		return nil, nil, RPCRequest{}, fmt.Errorf("准备 fresh WAA proof: %w", err)
 	}
 	if prepared.Headers == nil || len(prepared.Body) == 0 {
-		return nil, nil, RPCRequest{}, PreparedProtectedRequest{}, fmt.Errorf("WAA preparer 返回空请求")
+		return nil, nil, RPCRequest{}, fmt.Errorf("WAA preparer 返回空请求")
 	}
 	requestHeaders := rpc.Header
 	rpc.AccountID = lease.Account().ID
+	rpc.Body = prepared.Body
 	rpc.Header = prepared.Headers.Clone()
 	for name, values := range requestHeaders {
 		rpc.Header.Del(name)
@@ -247,12 +233,12 @@ func (t *WorkerProtectedTransport) prepareProtectedRequest(
 		}
 	}
 	rpc.Header.Set("Content-Type", JSONProtobufContentType)
-	return lease, worker, rpc, prepared, nil
+	return lease, worker, rpc, nil
 }
 
 // DoProtectedTitle 写入 GenerateTitle fresh proof 后经 Worker 页面发送请求，binding 为提示词与回答以空格连接，页面输入框为空
 func (t *WorkerProtectedTransport) DoProtectedTitle(ctx context.Context, request TitleRequest, rpc RPCRequest) (*RPCResponse, error) {
-	return t.doPrepared(ctx, request.Prompt+" "+request.Answer, "", "", AccountSelection{ModelID: request.Model}, rpc)
+	return t.doPrepared(ctx, request.Prompt+" "+request.Answer, "", 3, AccountSelection{ModelID: request.Model}, rpc)
 }
 
 func bindingPrompt(request GenerateRequest) (string, error) {
@@ -340,12 +326,10 @@ func (s *PooledService) Models(ctx context.Context) ([]Model, error) {
 // RefreshAccountModels 占用指定账户的一个普通槽位刷新其权益与模型目录，不受账户启用、调度状态与冷却限制；reload 为 true 时重新载入账户页面
 func (s *PooledService) RefreshAccountModels(ctx context.Context, accountID string, reload bool) ([]Model, error) {
 	accountID = strings.TrimSpace(accountID)
-	enter := s.refreshSteps(ctx, accountID, true)
 	lease, err := s.pool.AcquireFor(ctx, AccountSelection{AccountID: accountID, anyState: true})
 	if err != nil {
 		return nil, err
 	}
-	enter(AccountStepCatalog)
 	models, requestErr := s.modelsForLease(ContextWithAccountLease(ctx, lease), lease, reload)
 	releaseErr := lease.Release()
 	if requestErr != nil {
@@ -367,10 +351,9 @@ type AccountRefresh struct {
 	Skipped        bool
 }
 
-// RefreshAccountState 重新载入账户页面读取权益与模型目录，登录失效时标记账户需要登录，因上游要求验证而受限的账户在常驻 Worker 的页面上读取目录后再发一次生成请求核对验证状态；wait 为 true 时等待该账户的一个普通槽位且不受调度状态限制，否则只用就绪账户的空闲槽位
+// RefreshAccountState 重新载入账户页面读取权益与模型目录，登录失效时标记账户需要登录；wait 为 true 时等待该账户的一个普通槽位且不受调度状态限制，否则只用就绪账户的空闲槽位
 func (s *PooledService) RefreshAccountState(ctx context.Context, accountID string, wait bool) (AccountRefresh, error) {
 	accountID = strings.TrimSpace(accountID)
-	enter := s.refreshSteps(ctx, accountID, wait)
 	var lease *AccountLease
 	var err error
 	if wait {
@@ -386,16 +369,7 @@ func (s *PooledService) RefreshAccountState(ctx context.Context, accountID strin
 	refresh := AccountRefresh{PreviousTier: account.BenefitTier, PreviousModels: len(account.Models)}
 	previous := slices.Clone(account.Models)
 	s.pool.mu.Unlock()
-	catalogCtx := ctx
-	if s.pool.verificationRestricted(accountID) {
-		catalogCtx = ContextWithResidentCatalog(ctx)
-	}
-	enter(AccountStepCatalog)
-	models, err := s.modelsForLease(ContextWithAccountLease(catalogCtx, lease), lease, true)
-	if err == nil && s.pool.verificationRestricted(accountID) {
-		enter(AccountStepVerifying)
-		err = s.checkAccountVerification(ctx, lease)
-	}
+	models, err := s.modelsForLease(ContextWithAccountLease(ctx, lease), lease, true)
 	if err != nil {
 		return refresh, errors.Join(err, lease.Release())
 	}
@@ -405,80 +379,6 @@ func (s *PooledService) RefreshAccountState(ctx context.Context, accountID strin
 	s.pool.mu.Unlock()
 	refresh.Models = len(models)
 	return refresh, lease.Release()
-}
-
-// refreshStepsContextKey 是 context 中账户刷新与目录同步步骤回调的键
-type refreshStepsContextKey struct{}
-
-// ContextWithRefreshSteps 让账户刷新与目录同步在进入每一步时调用 report，index 从 1 开始，total 为这次操作的步数
-func ContextWithRefreshSteps(ctx context.Context, report func(step AccountStep, index, total int)) context.Context {
-	return context.WithValue(ctx, refreshStepsContextKey{}, report)
-}
-
-// refreshSteps 返回向 ctx 中的步骤回调报告进入一步的函数；wait 为 true 且账户没有空闲槽位时先报告等待在途请求
-// 步数为读取目录一步，加上等待与因要求验证而受限时的核对各一步
-func (s *PooledService) refreshSteps(ctx context.Context, accountID string, wait bool) func(AccountStep) {
-	report, _ := ctx.Value(refreshStepsContextKey{}).(func(AccountStep, int, int))
-	if report == nil {
-		return func(AccountStep) {}
-	}
-	waiting := wait && s.pool.SlotBusy(accountID)
-	steps, done := 1, 0
-	if waiting {
-		steps++
-	}
-	if s.pool.verificationRestricted(accountID) {
-		steps++
-	}
-	enter := func(step AccountStep) {
-		done++
-		report(step, done, max(steps, done))
-	}
-	if waiting {
-		enter(AccountStepWaiting)
-	}
-	return enter
-}
-
-// checkAccountVerification 以账户的页面初始化模型在租约内发一次最小生成请求，第一次被上游 403、协议错误码 7 拒绝时与普通请求一样在同一账户重试一次：生成成功时解除受限，上游仍拒绝账户时按其原因保持服务受限，其他失败保持受限并返回该失败
-func (s *PooledService) checkAccountVerification(ctx context.Context, lease *AccountLease) error {
-	accountID := lease.Account().ID
-	model, err := s.pool.BootstrapModel(accountID)
-	if err != nil {
-		return err
-	}
-	for attempt := 0; attempt < 2; attempt++ {
-		err = s.verificationGeneration(ctx, lease, model)
-		if _, rejected := AccountRejectionCooldown(err); !rejected {
-			break
-		}
-	}
-	if denial := RestrictionDenial(err); denial != nil {
-		return s.pool.MarkRestricted(accountID, denial)
-	}
-	if err != nil {
-		return err
-	}
-	return s.pool.clearRestriction(accountID)
-}
-
-// verificationGeneration 在租约内以 model 发一次最小生成请求并读完响应，返回生成或读取中的错误
-func (s *PooledService) verificationGeneration(ctx context.Context, lease *AccountLease, model string) error {
-	events, err := s.Generate(ContextWithAccountLease(ctx, lease), GenerateRequest{
-		Model: model, AccountID: lease.Account().ID, Contents: []Content{{Role: RoleUser, Parts: []Part{{Text: "Hi"}}}},
-	})
-	if err != nil {
-		return err
-	}
-	for event := range events {
-		if event.Kind == EventError {
-			err = event.Err
-		}
-	}
-	if err == nil {
-		err = ctx.Err()
-	}
-	return err
 }
 
 // CachedModels 返回启用账户最近同步目录的并集
@@ -589,7 +489,6 @@ func modelBoundRPCMethod(method string) bool {
 	}
 }
 
-// markRetryableFailure 记录可换号的失败：认证失败时确认账户会话，其余失败以收到失败的时刻为检查时刻按额度或 30 秒冷却该账户
 func (s *PooledService) markRetryableFailure(ctx context.Context, lease *AccountLease, modelAccessScope string, err error) error {
 	accountID := lease.Account().ID
 	if DefinitiveAuthenticationFailure(err) {
@@ -606,7 +505,9 @@ func (s *PooledService) markRetryableFailure(ctx context.Context, lease *Account
 	if cooldown.Global {
 		modelAccessScope = ""
 	}
-	_, _, markErr := s.pool.MarkQuotaCooldownIfGeneration(accountID, modelAccessScope, lease.ModelAccessGeneration(), now, cooldown)
+	_, markErr := s.pool.MarkQuotaCooldownIfGeneration(
+		accountID, modelAccessScope, lease.ModelAccessGeneration(), lease.CheckedAt(), cooldown,
+	)
 	return markErr
 }
 
@@ -618,16 +519,6 @@ func (s *PooledService) modelsForLease(ctx context.Context, lease *AccountLease,
 	if err != nil {
 		return nil, s.catalogFailure(leaseCtx, lease, err)
 	}
-	var hidden map[string]string
-	if s.DiscoverHiddenModels {
-		if hidden, err = s.client.DiscoverHiddenModels(leaseCtx, account.ID); err != nil {
-			slog.Warn("探测官网隐藏模型失败", "account", account.ID, "error", err)
-		}
-		models = s.client.accountModels(account.ID)
-	}
-	if err := s.pool.SetHiddenModels(account.ID, hidden, s.DiscoverHiddenModels && err == nil); err != nil {
-		return nil, err
-	}
 	buildEnabled := s.pool.BuildEnabled()
 	var buildModels []Model
 	var buildErr error
@@ -636,7 +527,9 @@ func (s *PooledService) modelsForLease(ctx context.Context, lease *AccountLease,
 	}
 	if err := errors.Join(
 		lease.MarkAuthenticationValid(),
-		s.pool.ClearPageCooldownIfGeneration(account.ID, lease.ModelAccessGeneration(), lease.CheckedAt()),
+		s.pool.ClearCooldownIfGeneration(
+			account.ID, "", lease.ModelAccessGeneration(), lease.CheckedAt(),
+		),
 	); err != nil {
 		return nil, err
 	}
@@ -652,117 +545,80 @@ func (s *PooledService) modelsForLease(ctx context.Context, lease *AccountLease,
 		slog.Warn("账户模型目录缓存保存失败", "account", account.ID, "error", err)
 	}
 	if buildEnabled && buildErr != nil {
-		err := fmt.Errorf("读取 Build 模型目录: %w", buildErr)
-		if !errors.Is(buildErr, context.Canceled) {
-			s.pool.recordCatalogFailure(account.ID, err)
-		}
-		return models, err
+		return models, fmt.Errorf("读取 Build 模型目录: %w", buildErr)
 	}
 	return models, nil
 }
 
-// catalogFailure 认证失败时确认账户会话并把已失效的账户标为需要登录，Google 拒绝该账户时标为服务受限，其余失败记为该账户最近一次目录读取错误，随请求取消而中止的读取不记
+// catalogFailure 认证失败时确认账户会话并把已失效的账户标为需要登录，其余失败记为该账户最近一次目录读取错误
 func (s *PooledService) catalogFailure(ctx context.Context, lease *AccountLease, err error) error {
 	if DefinitiveAuthenticationFailure(err) {
 		return errors.Join(err, lease.ConfirmAuthenticationFailure(ctx, err))
 	}
-	if denial := RestrictionDenial(err); denial != nil {
-		return errors.Join(err, s.pool.MarkRestricted(lease.Account().ID, denial))
-	}
-	if !errors.Is(err, context.Canceled) {
-		s.pool.recordCatalogFailure(lease.Account().ID, err)
-	}
+	s.pool.recordCatalogFailure(lease.Account().ID, err)
 	return err
 }
 
-// CountTokens 使用支持目标模型的独占账户按客户端给出的对话计数，只有系统指令时以 user 轮计数后还原为系统指令明细
+// CountTokens 使用支持目标模型的独占账户计数
 func (s *PooledService) CountTokens(ctx context.Context, request TokenCountRequest) (TokenCount, error) {
 	modelID := strings.TrimPrefix(strings.TrimSpace(request.Model), "models/")
 	if modelID == "" {
 		return TokenCount{}, fmt.Errorf("%w: CountTokens model 不能为空", ErrInvalidArgument)
 	}
-	request.System = clientSystem(request.System)
-	request.Contents = dropUserRejected(request.Contents)
+	request.System, request.Contents = normalizeTurns(request.System, request.Contents, s.rewritesAssistantTail(modelID), s.ContinuationPrompt)
 	if s.YouTubeLinks {
 		request.Contents = attachYouTubeLinks(request.Contents)
 	}
 	if s.StripThoughtSignatures {
 		request.Contents = stripThoughtSignatures(request.Contents)
 	}
-	systemOnly := len(request.Contents) == 0
-	if systemOnly {
-		if strings.TrimSpace(SystemText(request.System)) == "" {
-			return TokenCount{}, fmt.Errorf("%w: 请求没有系统提示或对话内容", ErrInvalidArgument)
-		}
-		request.System, request.Contents = nil, []Content{{Role: RoleUser, Parts: []Part{{Text: SystemText(request.System)}}}}
+	if len(request.Contents) == 0 {
+		return TokenCount{}, fmt.Errorf("%w: 请求没有系统提示或对话内容", ErrInvalidArgument)
 	}
 	modelAccessScope := ModelAccessKey("count-tokens", modelID)
 	selection := AccountSelection{ModelID: modelID, ModelAccessScope: modelAccessScope, Method: "countTokens"}
 	if mixedMediaResolution(request.MediaResolution, request.Contents) {
 		selection.Channel = ChannelBuild
 	}
-	count, err := withAccountAttempts(ctx, s, selection, modelAccessScope, func(ctx context.Context, accountID string) (TokenCount, error) {
-		return s.client.CountTokensForAccount(ctx, accountID, request)
-	})
-	if systemOnly && len(count.Contents) == 1 {
-		count = systemOnlyCount(count)
-	}
-	return count, err
-}
-
-// withAccountAttempts 按 selection 取号后以租约上下文与账户 ID 调用 call：成功时清除账户在 scope 上的冷却，上游要求验证或拒绝账户时标为服务受限，其余可换号的失败写入 scope 上的冷却后换到其他账户，尝试次数不超过请求开始时的可调度账户数，指定账户或沿用上下文租约时只试一次；全部候选账户冷却且不再排队时返回 AllCoolingError
-func withAccountAttempts[T any](ctx context.Context, s *PooledService, selection AccountSelection, scope string, call func(context.Context, string) (T, error)) (T, error) {
-	_, leased := AccountLeaseFromContext(ctx)
-	limit := accountAttemptLimit(s.pool, leased || selection.AccountID != "")
-	var result T
+	var count TokenCount
 	var requestErr error
-	for attempt := 0; attempt < limit; attempt++ {
-		lease, owned, err := acquireQueuedLease(ctx, s.pool, selection)
+	for attempt := 0; attempt < accountAttemptLimit(s.pool, false); attempt++ {
+		lease, owned, err := resolveAccountLease(ctx, s.pool, selection)
 		if err != nil {
 			if requestErr != nil && errors.Is(err, ErrNoEligibleAccount) {
-				return result, requestErr
+				return count, requestErr
 			}
-			return result, err
+			return TokenCount{}, err
 		}
 		accountID := lease.Account().ID
-		result, requestErr = call(ContextWithAccountLease(ctx, lease), accountID)
-		cooldownScope := lease.CooldownScope(scope)
-		retryable := retryableAccountError(requestErr)
+		count, requestErr = s.client.CountTokensForAccount(ContextWithAccountLease(ctx, lease), accountID, request)
 		var stateErr error
+		retryable := retryableAccountError(requestErr)
 		if requestErr == nil {
 			stateErr = errors.Join(
 				lease.MarkAuthenticationValid(),
-				s.pool.ClearCooldownIfGeneration(accountID, cooldownScope, lease.ModelAccessGeneration(), lease.CheckedAt()),
+				s.pool.ClearCooldownIfGeneration(
+					accountID, modelAccessScope, lease.ModelAccessGeneration(), lease.CheckedAt(),
+				),
 			)
 		} else if DefinitiveAuthenticationFailure(requestErr) {
 			stateErr = lease.ConfirmAuthenticationFailure(ctx, requestErr)
-		} else if denial := RestrictionDenial(requestErr); denial != nil {
-			stateErr = s.pool.MarkRestricted(accountID, denial)
 		} else if retryable {
-			stateErr = s.markRetryableFailure(ctx, lease, cooldownScope, requestErr)
+			stateErr = s.markRetryableFailure(ctx, lease, modelAccessScope, requestErr)
 		}
 		var releaseErr error
 		if owned {
 			releaseErr = lease.Release()
 		}
-		if requestErr == nil || !retryable || !owned {
-			return result, errors.Join(requestErr, stateErr, releaseErr)
+		if requestErr == nil || !retryable {
+			return count, errors.Join(requestErr, stateErr, releaseErr)
 		}
 		requestErr = errors.Join(requestErr, stateErr, releaseErr)
 		if stateErr != nil || releaseErr != nil {
-			return result, requestErr
+			return count, requestErr
 		}
 	}
-	return result, requestErr
-}
-
-// systemOnlyCount 把只有系统指令的请求以 user 轮计数的结果还原为系统指令明细，与系统指令一样不计角色 token
-func systemOnlyCount(count TokenCount) TokenCount {
-	role := count.Contents[0].RoleTokens
-	count.InputTokens -= role
-	count.PromptTokensDetails = subtractTextTokens(count.PromptTokensDetails, role)
-	count.System, count.Contents = &ContentTokens{PartTokens: count.Contents[0].PartTokens}, nil
-	return count
+	return count, requestErr
 }
 
 // ValidateGenerateRequest 在选择账户前校验与上游通道无关的生成参数
@@ -771,11 +627,15 @@ func (s *PooledService) ValidateGenerateRequest(request GenerateRequest) error {
 	if modelID == "" {
 		return fmt.Errorf("%w: GenerateContent model 不能为空", ErrInvalidArgument)
 	}
+	if baseModel, ok := ResolveAntiCensorModel(modelID); ok {
+		modelID = baseModel
+		request.Model = baseModel
+	}
 	request.System, request.Contents = normalizeTurns(request.System, request.Contents, s.rewritesAssistantTail(modelID), s.ContinuationPrompt)
 	if len(request.Contents) == 0 {
 		return fmt.Errorf("%w: 请求没有系统提示或对话内容", ErrInvalidArgument)
 	}
-	request, _, err := prepareToolRequest(request, false)
+	request, _, err := prepareToolRequest(request)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
@@ -801,6 +661,10 @@ func (s *PooledService) Generate(ctx context.Context, request GenerateRequest) (
 	if modelID == "" {
 		return nil, fmt.Errorf("%w: GenerateContent model 不能为空", ErrInvalidArgument)
 	}
+	// -uncut 只影响请求编码与事件过滤，账户选择与冷却使用基础模型
+	if baseModel, ok := ResolveAntiCensorModel(modelID); ok {
+		modelID = baseModel
+	}
 	request.System, request.Contents = s.generateTurns(request)
 	if len(request.Contents) == 0 {
 		return nil, fmt.Errorf("%w: 请求没有系统提示或对话内容", ErrInvalidArgument)
@@ -816,7 +680,10 @@ func (s *PooledService) Generate(ctx context.Context, request GenerateRequest) (
 		AccountID:  strings.TrimSpace(request.AccountID),
 		ResourceID: resourceID,
 	}
-	if RequestNeedsBuild(request) || request.Unary && s.BuildNativeNonstream {
+	if request.AntiCensor {
+		selection.PlaygroundOnly = true
+	}
+	if !request.AntiCensor && (RequestNeedsBuild(request) || request.Unary && s.BuildNativeNonstream) {
 		selection.PreferredChannel = ChannelBuild
 	}
 	pinned := selection.AccountID != "" || selection.ResourceID != ""
@@ -934,7 +801,7 @@ func forwardEventsWithLease(
 				if cooldown.Global {
 					scope = ""
 				}
-				if _, _, err := pool.MarkQuotaCooldownIfGeneration(accountID, scope, accessGeneration, time.Now(), cooldown); err != nil {
+				if _, err := pool.MarkQuotaCooldownIfGeneration(accountID, scope, accessGeneration, checkedAt, cooldown); err != nil {
 					event.Err = errors.Join(event.Err, err)
 				}
 			}

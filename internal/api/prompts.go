@@ -29,10 +29,6 @@ type PromptSummary struct {
 	Description string    `json:"description"`
 	Created     time.Time `json:"created_at"`
 	Updated     time.Time `json:"updated_at"`
-	// Turns 是保存时对话的消息条数，没有记录时为空
-	Turns *int `json:"turns,omitempty"`
-	// Tokens 是保存时整段对话的 token 数，没有记录时为空
-	Tokens *int `json:"tokens,omitempty"`
 }
 
 // Prompt 是一份保存的对话，Data 为管理端写入的对话内容
@@ -143,8 +139,6 @@ func (s *server) handleSavePrompt(w http.ResponseWriter, r *http.Request) {
 		Title       string          `json:"title"`
 		Model       string          `json:"model"`
 		Description string          `json:"description"`
-		Turns       *int            `json:"turns"`
-		Tokens      *int            `json:"tokens"`
 		Data        json.RawMessage `json:"data"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
@@ -156,8 +150,7 @@ func (s *server) handleSavePrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	saved, err := s.config.Prompts.SavePrompt(r.Context(), Prompt{
-		PromptSummary: PromptSummary{ID: id, Title: body.Title, Model: body.Model, Description: body.Description, Turns: body.Turns, Tokens: body.Tokens},
-		Data:          body.Data,
+		PromptSummary: PromptSummary{ID: id, Title: body.Title, Model: body.Model, Description: body.Description}, Data: body.Data,
 	})
 	if err != nil {
 		writeAdminError(w, http.StatusInternalServerError, "prompt_store_failed", err.Error())

@@ -1,5 +1,3 @@
-import logo_google from '@lobehub/icons-static-svg/icons/google.svg?raw'
-import logo_google_color from '@lobehub/icons-static-svg/icons/google-color.svg?raw'
 import symbol_account_circle from '@material-symbols/svg-300/outlined/account_circle.svg?raw'
 import symbol_add from '@material-symbols/svg-300/outlined/add.svg?raw'
 import symbol_add_circle from '@material-symbols/svg-300/outlined/add_circle.svg?raw'
@@ -12,7 +10,6 @@ import symbol_arrow_split from '@material-symbols/svg-300/outlined/arrow_split.s
 import symbol_arrow_upward from '@material-symbols/svg-300/outlined/arrow_upward.svg?raw'
 import symbol_asterisk from '@material-symbols/svg-300/outlined/asterisk.svg?raw'
 import symbol_attach_money from '@material-symbols/svg-300/outlined/attach_money.svg?raw'
-import symbol_audio_file from '@material-symbols/svg-300/outlined/audio_file.svg?raw'
 import symbol_bar_chart from '@material-symbols/svg-300/outlined/bar_chart.svg?raw'
 import symbol_cable from '@material-symbols/svg-300/outlined/cable.svg?raw'
 import symbol_chat from '@material-symbols/svg-300/outlined/chat.svg?raw'
@@ -37,7 +34,6 @@ import symbol_download from '@material-symbols/svg-300/outlined/download.svg?raw
 import symbol_edit from '@material-symbols/svg-300/outlined/edit.svg?raw'
 import symbol_error from '@material-symbols/svg-300/outlined/error.svg?raw'
 import symbol_file_json from '@material-symbols/svg-300/outlined/file_json.svg?raw'
-import symbol_folder from '@material-symbols/svg-300/outlined/folder.svg?raw'
 import symbol_format_align_left from '@material-symbols/svg-300/outlined/format_align_left.svg?raw'
 import symbol_fullscreen from '@material-symbols/svg-300/outlined/fullscreen.svg?raw'
 import symbol_fullscreen_exit from '@material-symbols/svg-300/outlined/fullscreen_exit.svg?raw'
@@ -91,6 +87,7 @@ import symbol_stars from '@material-symbols/svg-300/outlined/stars.svg?raw'
 import symbol_stop from '@material-symbols/svg-300/outlined/stop.svg?raw'
 import symbol_stop_circle from '@material-symbols/svg-300/outlined/stop_circle.svg?raw'
 import symbol_support_agent from '@material-symbols/svg-300/outlined/support_agent.svg?raw'
+import symbol_swap_horiz from '@material-symbols/svg-300/outlined/swap_horiz.svg?raw'
 import symbol_terminal from '@material-symbols/svg-300/outlined/terminal.svg?raw'
 import symbol_text_compare from '@material-symbols/svg-300/outlined/text_compare.svg?raw'
 import symbol_toll from '@material-symbols/svg-300/outlined/toll.svg?raw'
@@ -149,9 +146,6 @@ export const icons = {
   channel: symbol_route,
   download: symbol_download,
   search: symbol_search,
-  google: logo_google,
-  googleColor: logo_google_color,
-  folder: symbol_folder,
   send: symbol_arrow_upward,
   options: symbol_tune,
   newChat: symbol_add,
@@ -177,7 +171,6 @@ export const icons = {
   tools: symbol_widgets,
   mic: symbol_mic,
   audioEnabled: symbol_video_audio_call,
-  audioFile: symbol_audio_file,
   keyboardReturn: symbol_keyboard_return,
   keyboardCommandKey: symbol_keyboard_command_key,
   code: symbol_code,
@@ -215,6 +208,7 @@ export const icons = {
   asterisk: symbol_asterisk,
   chatBubble: symbol_chat_bubble,
   addPhoto: symbol_add_photo_alternate,
+  swapHoriz: symbol_swap_horiz,
   fullscreen: symbol_fullscreen,
   fullscreenExit: symbol_fullscreen_exit,
   hub: symbol_hub,

@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
@@ -25,7 +26,6 @@ func (service *trackedService) Embed(ctx context.Context, request aistudio.Embed
 	service.requests.start(aistudio.GenerateRequest{ID: request.ID, Model: request.Model}, cancel)
 	request.CandidateAccountIDs, err = service.embeddingCandidates(requestCtx, modelID)
 	if err != nil {
-		err = endedRequestError(requestCtx, err)
 		api.SetAccessLogError(requestCtx, err)
 		service.requests.finish(request.ID, finalRequestState(err))
 		return aistudio.EmbeddingResult{}, err
@@ -33,7 +33,9 @@ func (service *trackedService) Embed(ctx context.Context, request aistudio.Embed
 	workerGenerations := make(map[string]uint64)
 	recoveredWorkers := make(map[string]struct{})
 	request.ObserveAccountFailure = func(accountID string, cause error) {
-		service.requests.logRequestProgress(request.ID, service.accountLabel(accountID), "WARN", "账号切换", attemptFields(modelID, cause)...)
+		service.requests.logRequestProgress(request.ID, service.accountLabel(accountID), "WARN", fmt.Sprintf(
+			"账号切换 | 模型=%s\n原因: %s", modelID, strings.TrimSpace(cause.Error()),
+		))
 	}
 	request.RecoverWAARuntime = func(recoveryCtx context.Context, accountID string, cause error) (bool, error) {
 		workerFailed := service.workers.WorkerFailed(accountID)
@@ -46,12 +48,11 @@ func (service *trackedService) Embed(ctx context.Context, request aistudio.Embed
 			true, workerFailed || aistudio.DefinitiveWAARuntimeFailure(cause),
 		)
 		if recovered && recoveryErr == nil {
-			service.requests.logRequestProgress(request.ID, service.accountLabel(accountID), "WARN", "WAA Worker 重建，重放当前请求", "model", modelID)
+			service.requests.logRequestProgress(request.ID, service.accountLabel(accountID), "WARN", "WAA Worker 重建 | 模型="+modelID+" | 重放当前请求")
 		}
 		return recovered, recoveryErr
 	}
-	observed := aistudio.ContextWithAccountSelectionObserver(requestCtx, func(lease *aistudio.AccountLease) {
-		account := lease.Account()
+	observed := aistudio.ContextWithAccountSelectionObserver(requestCtx, func(account *aistudio.Account) {
 		workerGenerations[account.ID] = service.workers.WorkerGeneration(account.ID)
 		api.SetAccessLogChannel(requestCtx, string(aistudio.ChannelBuild))
 		api.SetAccessLogTarget(requestCtx, modelID, account.Config.Label)
@@ -60,7 +61,6 @@ func (service *trackedService) Embed(ctx context.Context, request aistudio.Embed
 		service.requests.markChannel(request.ID, string(aistudio.ChannelBuild))
 	})
 	result, err := service.service.(aistudio.EmbeddingService).Embed(observed, request)
-	err = endedRequestError(requestCtx, err)
 	if err == nil {
 		api.SetAccessLogGenerationResult(requestCtx, &aistudio.Usage{InputTokens: result.TokenCount, TotalTokens: result.TokenCount}, 0)
 	}

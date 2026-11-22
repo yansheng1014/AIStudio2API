@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-	"time"
 )
 
 // TestAgentToolSchemaCompatibility 验证常见 Agent 工具 Schema 的稳定转换规则
@@ -205,7 +204,7 @@ func TestAttachYouTubeMediaVideoIDs(t *testing.T) {
 	}
 }
 
-// TestFunctionResultNameInference 验证工具结果的唯一关联与原始输入保留，关联不到调用的结果以 functionResponse 文本转录发送
+// TestFunctionResultNameInference 验证工具结果的唯一关联与原始输入保留
 func TestFunctionResultNameInference(t *testing.T) {
 	call := func(id, name string) Part {
 		return Part{FunctionCall: &FunctionCall{ID: id, Name: name, Arguments: json.RawMessage(`{}`)}}
@@ -232,42 +231,22 @@ func TestFunctionResultNameInference(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			wire, err := encodeContents(test.contents)
+			if test.want == "" {
+				if err == nil {
+					t.Fatalf("unresolved result accepted: %#v", wire)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
-			part := wire[len(wire)-1].([]any)[0].([]any)[0].([]any)
-			if test.want == "" {
-				text, _ := part[1].(string)
-				if len(part) > 11 || !strings.HasPrefix(text, `{"functionResponse":`) {
-					t.Fatalf("unresolved result part=%#v", part)
-				}
-			} else if last := part[11].([]any); last[0] != test.want {
+			last := wire[len(wire)-1].([]any)[0].([]any)[0].([]any)[11].([]any)
+			if last[0] != test.want {
 				t.Fatalf("name=%v want=%s", last[0], test.want)
 			}
 			if test.contents[len(test.contents)-1].Parts[0].FunctionResult.Name != "" {
 				t.Fatal("input mutated")
 			}
 		})
-	}
-}
-
-// TestPlanLimitQuotaCooldown 验证上游以 usage limit 拒绝且没有给出恢复时间时按套餐限额从 1 分钟递增到 60 分钟冷却
-func TestPlanLimitQuotaCooldown(t *testing.T) {
-	now := time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
-	err := &RPCError{Method: "GenerateContent", StatusCode: http.StatusTooManyRequests, Code: 8, Message: "You've reached your usage limit. Please try again later."}
-	cooldown, ok := QuotaCooldownForError(err, now)
-	if !ok || cooldown.Kind != PlanLimitKind || !cooldown.Escalate || !RequestQuotaCooldown(cooldown.Reason) {
-		t.Fatalf("cooldown=%+v ok=%v", cooldown, ok)
-	}
-	var state CooldownState
-	exists := false
-	current := now
-	for _, want := range []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute, 30 * time.Minute, time.Hour} {
-		state = planLimitCooldown(state, exists, current, cooldown.Reason)
-		exists = true
-		if got := state.Until.Sub(current); got != want {
-			t.Fatalf("backoff=%s want=%s state=%+v", got, want, state)
-		}
-		current = state.Until
 	}
 }

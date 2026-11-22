@@ -103,8 +103,6 @@ type modelCatalog struct {
 	entries map[string]modelEntry
 	// source 是解析出该目录的 ListModels 响应 JSON
 	source json.RawMessage
-	// bundle 是载入该目录的官网页面的前端主程序地址
-	bundle string
 }
 
 // ParseModels 解码 ListModels 的数组协议
@@ -284,12 +282,6 @@ func decodeModelRow(raw json.RawMessage, rowIndex int) (modelEntry, error) {
 			}
 			model.Capabilities["interaction_task"] = background
 		}
-		kind, err := optionalIntField(interaction, 3, path+"[78]", raw)
-		if err != nil {
-			return modelEntry{}, withMethod(err, "ListModels")
-		}
-		// field 4 为 2 且不是后台任务的模型经 CreateInteractionStream 生成，与官网一样以内联数据发送图片
-		model.Capabilities["interaction_stream"] = kind == 2 && !model.Capabilities["interaction_task"]
 		if value := rawAt(interaction, 5); !isJSONNull(value) {
 			agentModel, err := rawString(value, path+"[78][5]", raw)
 			if err != nil {
@@ -610,13 +602,6 @@ func (c *Client) setModelCatalog(accountID string, catalog modelCatalog) {
 	c.catalogMu.Lock()
 	c.catalogs[accountID] = catalog
 	c.catalogMu.Unlock()
-}
-
-// accountModels 返回账户当前目录中的模型
-func (c *Client) accountModels(accountID string) []Model {
-	c.catalogMu.RLock()
-	defer c.catalogMu.RUnlock()
-	return cloneModels(c.catalogs[accountID].models)
 }
 
 // modelCatalogSource 返回账户最近一次 ListModels 的响应 JSON

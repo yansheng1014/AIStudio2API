@@ -137,7 +137,7 @@ function download(): void {
 }
 
 .code-body code {
-  font-family: var(--font-mono);
+  font-family: monospace;
   font-size: 13px;
 }
 </style>

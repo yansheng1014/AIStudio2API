@@ -1,21 +1,17 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { parseAccountBindings } from '@/accountBindings'
 import { api } from '@/api'
 import { maskKey, splitKeys } from '@/apikey'
-import { desktopPlatform, keepPage, sendDesktop } from '@/desktop'
+import { keepPage } from '@/desktop'
 import { channelLabelKey, useI18n, type TranslationKey } from '@/i18n'
 import type { IconName } from '@/icons'
 import { maskedProxy } from '@/proxy'
 import type { Account, FirstEventLatency, Model, ServiceConfig, UpstreamChannel } from '@/types'
 import { useQueryParam } from '@/url'
-import { SliderRange, SliderRoot, SliderThumb, SliderTrack } from 'reka-ui'
-import AccountOrderList from './AccountOrderList.vue'
 import ApiKeyInput from './ApiKeyInput.vue'
 import DurationInput from './DurationInput.vue'
 import PairRows from './PairRows.vue'
-import PathList from './PathList.vue'
 import SettingRow from './SettingRow.vue'
 import UiIcon from './UiIcon.vue'
 import UiSelect from './UiSelect.vue'
@@ -42,22 +38,23 @@ const adminPassword = ref('')
 // form 是编辑中的配置，读到 props.config 后由 resetForm 填入，表单只在读到配置后显示
 const form = reactive({} as ServiceConfig)
 
-type SectionID = 'service' | 'capacity' | 'runtime' | 'models' | 'network' | 'security'
+type SectionID = 'service' | 'capacity' | 'upstream' | 'network' | 'security'
 
 // sections 是设置分组与各组包含的可编辑字段
 const sections: {
   id: SectionID
   label: TranslationKey
+  description: TranslationKey
   icon: IconName
   fields: (keyof ServiceConfig)[]
 }[] = [
   {
     id: 'service',
     label: 'settings.section.service',
+    description: 'settings.section.serviceHelp',
     icon: 'service',
     fields: [
       'auto_start',
-      'hide_dock_icon',
       'listen_addr',
       'preview_listen_addr',
       'proxy_api_key',
@@ -70,6 +67,7 @@ const sections: {
   {
     id: 'capacity',
     label: 'settings.section.capacity',
+    description: 'settings.section.capacityHelp',
     icon: 'capacity',
     fields: [
       'warm_worker_limit',
@@ -77,18 +75,27 @@ const sections: {
       'warm_startup_concurrency',
       'per_account_concurrency',
       'routing_strategy',
-      'account_order',
-      'max_account_switches',
     ],
   },
   {
-    id: 'runtime',
-    label: 'settings.section.runtime',
+    id: 'upstream',
+    label: 'settings.section.upstream',
+    description: 'settings.section.upstreamHelp',
     icon: 'channel',
     fields: [
-      'waa_backend',
       'upstream_channels',
+      'model_mapping',
+      'model_channels',
       'build_native_nonstream',
+      'nonstream_keepalive',
+      'fake_stream',
+      'youtube_links',
+      'search_model_aliases',
+      'google_search',
+      'continuation_rewrite',
+      'continuation_prompt',
+      'strip_thought_signatures',
+      'waa_backend',
       'init_timeout',
       'request_timeout',
       'first_event_hedge',
@@ -96,32 +103,16 @@ const sections: {
     ],
   },
   {
-    id: 'models',
-    label: 'settings.section.models',
-    icon: 'boxes',
-    fields: [
-      'model_mapping',
-      'model_channels',
-      'nonstream_keepalive',
-      'fake_stream',
-      'youtube_links',
-      'search_model_aliases',
-      'discover_hidden_models',
-      'google_search',
-      'continuation_rewrite',
-      'continuation_prompt',
-      'strip_thought_signatures',
-    ],
-  },
-  {
     id: 'network',
     label: 'settings.section.network',
+    description: 'settings.section.networkHelp',
     icon: 'network',
     fields: ['proxy'],
   },
   {
     id: 'security',
     label: 'settings.section.security',
+    description: 'settings.section.securityHelp',
     icon: 'security',
     fields: [
       'admin_auth_enabled',
@@ -140,72 +131,8 @@ const section = useQueryParam<SectionID>(
 const current = computed(() => sections.find((item) => item.id === section.value)!)
 
 const upstreamChannelOptions: UpstreamChannel[] = ['playground', 'build']
-const waaBackendOptions: { value: ServiceConfig['waa_backend']; label: TranslationKey }[] = [
-  { value: 'camoufox', label: 'settings.waaBackendCamoufox' },
-  { value: 'spidermonkey', label: 'settings.waaBackendSpiderMonkey' },
-]
 const inputClass =
   'w-full rounded-md border border-line bg-canvas px-3 py-2 text-sm text-white transition focus:border-blue-500 focus:outline-none'
-
-// capacityItems 是合并到一行的容量字段
-const capacityItems: {
-  field:
-    | 'warm_worker_limit'
-    | 'max_active_workers'
-    | 'warm_startup_concurrency'
-    | 'per_account_concurrency'
-  label: TranslationKey
-}[] = [
-  { field: 'warm_worker_limit', label: 'settings.warmWorkerLimit' },
-  { field: 'max_active_workers', label: 'settings.maxActiveWorkers' },
-  { field: 'warm_startup_concurrency', label: 'settings.warmStartupConcurrency' },
-  { field: 'per_account_concurrency', label: 'settings.perAccountConcurrency' },
-]
-
-// capacityLocked 是由环境变量决定的容量字段对应的变量名，没有时为 undefined
-const capacityLocked = computed(() => {
-  const keys = capacityItems
-    .map((item) => environmentKey(item.field))
-    .filter((key) => key !== undefined)
-  return keys.length > 0 ? keys.join(', ') : undefined
-})
-
-// previewFallback 表示保存的预览地址已在本次启动生效，但端口不可用、预览服务改用了空闲端口
-const previewFallback = computed(
-  () =>
-    props.config !== null &&
-    !props.config.management_restart_required &&
-    form.preview_listen_addr === props.config.preview_listen_addr &&
-    props.config.preview_listen_addr !== props.config.active_preview_listen_addr,
-)
-
-// capacityLimit 是 Worker 滑块的上限：所选 WAA 后端默认峰值的两倍（SpiderMonkey 20、Camoufox 10），账户数或输入的峰值更大时取其值
-const capacityLimit = computed(() =>
-  Math.max(
-    form.waa_backend === 'camoufox' ? 20 : 40,
-    props.accounts.length,
-    form.max_active_workers,
-  ),
-)
-
-// setWorkerRange 把滑块的两端写回常驻数与峰值上限
-function setWorkerRange(range: number[] | undefined): void {
-  if (range === undefined) return
-  ;[form.warm_worker_limit, form.max_active_workers] = range as [number, number]
-}
-
-// capacitySummary 是当前容量下最多同时处理的请求数：运行的 Worker 数不超过账户数
-const capacitySummary = computed(() =>
-  t(props.accounts.length === 1 ? 'settings.capacitySummaryOne' : 'settings.capacitySummary')
-    .replace(
-      '{requests}',
-      String(
-        Math.min(form.max_active_workers, props.accounts.length || form.max_active_workers) *
-          form.per_account_concurrency,
-      ),
-    )
-    .replace('{accounts}', String(props.accounts.length)),
-)
 
 // changedFields 返回表单中与已保存配置不同的字段
 const changedFields = computed(() => {
@@ -256,15 +183,9 @@ const hedgeMode = computed({
   },
 })
 
-// hedgeDescription 是问号里的说明，自动方式时附上取值规则
-const hedgeDescription = computed(() =>
-  hedgeMode.value === 'auto'
-    ? `${t('settings.firstEventHedgeHelp')}。${t('settings.firstEventHedgeAutoHint')}`
-    : t('settings.firstEventHedgeHelp'),
-)
-
-// hedgeHint 是自定义方式下 busiest 的近期 p95 参考
+// hedgeHint 是所选方式的说明：自动时写取值规则，自定义时给出 busiest 的近期 p95 作参考
 const hedgeHint = computed(() => {
+  if (hedgeMode.value === 'auto') return t('settings.firstEventHedgeAutoHint')
   const item = busiest.value
   if (hedgeMode.value !== 'custom' || item === undefined) return ''
   return t('settings.firstEventHedgeCustomHint')
@@ -286,6 +207,21 @@ const apiKeyList = computed(() => splitKeys(form.proxy_api_key ?? ''))
 // activeKeys 是生效中的各个 API key
 const activeKeys = computed(() => splitKeys(props.config?.active_proxy_api_key ?? ''))
 
+// keyAccounts 把 api_key_accounts 解析为各 key 可用的账户 ID
+function keyAccounts(value: string): Map<string, string[]> {
+  const result = new Map<string, string[]>()
+  for (const item of value.split(',')) {
+    const index = item.lastIndexOf(':')
+    const ids = item
+      .slice(index + 1)
+      .split('|')
+      .map((id) => id.trim())
+      .filter(Boolean)
+    if (index > 0 && ids.length > 0) result.set(item.slice(0, index).trim(), ids)
+  }
+  return result
+}
+
 // writeKeyAccounts 按 API key 的顺序写回 api_key_accounts，去掉已不在 key 列表中的绑定
 function writeKeyAccounts(bindings: Map<string, string[]>): void {
   form.api_key_accounts = apiKeyList.value
@@ -295,7 +231,7 @@ function writeKeyAccounts(bindings: Map<string, string[]>): void {
 }
 
 // keyBindings 是表单中各 API key 可用的账户 ID
-const keyBindings = computed(() => parseAccountBindings(form.api_key_accounts ?? ''))
+const keyBindings = computed(() => keyAccounts(form.api_key_accounts ?? ''))
 
 // setKeyAccounts 设置 key 可用的账户，空列表表示可用全部账户
 function setKeyAccounts(key: string, ids: string[]): void {
@@ -343,8 +279,7 @@ const hedgeModelsLabel = computed(() => {
 })
 
 watch(apiKeyList, () => {
-  if (form.api_key_accounts !== undefined)
-    writeKeyAccounts(parseAccountBindings(form.api_key_accounts))
+  if (form.api_key_accounts !== undefined) writeKeyAccounts(keyAccounts(form.api_key_accounts))
 })
 
 // resetForm 用已保存配置覆盖表单
@@ -398,12 +333,9 @@ async function saveConfig(): Promise<void> {
   try {
     const saved = await api.saveConfig({
       ...form,
-      warm_worker_limit: Math.min(form.warm_worker_limit, form.max_active_workers),
-      warm_startup_concurrency: Math.min(form.warm_startup_concurrency, form.max_active_workers),
       ...(adminPassword.value ? { admin_password: adminPassword.value } : {}),
     })
     emit('saved', saved)
-    if (desktopPlatform === 'darwin') sendDesktop(`dock:${saved.hide_dock_icon ? 'hide' : 'show'}`)
     if (saved.management_restart_required && saved.service_restart_required) {
       emit('notice', t('settings.savedBoth'), 'success')
     } else if (saved.management_restart_required) {
@@ -423,15 +355,18 @@ async function saveConfig(): Promise<void> {
 
 <template>
   <section class="flex min-h-0 flex-1 flex-col">
-    <header class="page-x overflow-hidden border-b border-line py-4 [scrollbar-gutter:stable]">
+    <header
+      class="border-b border-line px-4 py-4 md:px-[max(2rem,calc((100%_-_var(--container-4xl)_-_14rem)/2_+_2rem))]"
+    >
       <h2 class="text-xl font-semibold text-white">{{ t('section.settings.title') }}</h2>
       <p class="mt-1 text-sm text-gray-500">{{ t('section.settings.description') }}</p>
     </header>
 
-    <div v-if="error" class="page-x overflow-hidden py-4 [scrollbar-gutter:stable] md:py-8">
-      <div class="rounded-md border border-red-500/40 bg-red-500/10 p-4 text-red-300">
-        {{ error }}
-      </div>
+    <div
+      v-if="error"
+      class="m-4 rounded-md border border-red-500/40 bg-red-500/10 p-4 text-red-300 md:m-8"
+    >
+      {{ error }}
     </div>
     <div v-else-if="loading || config === null" class="py-16 text-center text-gray-500">
       <UiIcon name="spinner" :size="18" class="mx-auto mb-2" />
@@ -439,20 +374,22 @@ async function saveConfig(): Promise<void> {
     </div>
     <form
       v-else
-      class="min-h-0 flex-1 overflow-auto [scrollbar-gutter:stable]"
+      class="min-h-0 flex-1 overflow-auto [scrollbar-gutter:stable_both-edges]"
       novalidate
       @submit.prevent="saveConfig"
     >
-      <div class="page-x flex flex-col @max-3xl:px-0 @3xl:flex-row">
+      <div
+        class="mx-auto flex w-full max-w-[calc(var(--container-4xl)_+_14rem)] flex-col md:flex-row"
+      >
         <nav
-          class="sticky top-0 z-10 flex shrink-0 gap-1 overflow-x-auto border-b border-line bg-canvas px-4 py-2 @3xl:w-56 @3xl:flex-col @3xl:self-start @3xl:border-b-0 @3xl:px-0 @3xl:py-8"
+          class="sticky top-0 z-10 flex shrink-0 gap-1 overflow-x-auto border-b border-line bg-canvas p-2 md:w-56 md:flex-col md:self-start md:border-b-0 md:p-4 md:pl-5"
           :aria-label="t('section.settings.title')"
         >
           <button
             v-for="item in sections"
             :key="item.id"
             type="button"
-            class="flex shrink-0 items-center gap-2 rounded-md px-3 py-2 text-left text-sm whitespace-nowrap transition-colors @3xl:whitespace-normal"
+            class="flex shrink-0 items-center gap-2 rounded-md px-3 py-2 text-left text-sm whitespace-nowrap transition-colors md:whitespace-normal"
             :class="
               section === item.id
                 ? 'bg-raised text-white'
@@ -466,13 +403,13 @@ async function saveConfig(): Promise<void> {
             <span
               v-if="sectionChanged(item)"
               v-tooltip="t('settings.unsavedSection')"
-              class="h-1.5 w-1.5 rounded-full bg-gray-400"
+              class="h-1.5 w-1.5 rounded-full bg-amber-400"
               ><span class="sr-only">{{ t('settings.unsavedSection') }}</span></span
             >
           </button>
         </nav>
 
-        <div class="min-w-0 flex-1 px-4 pt-4 pb-28 @3xl:pt-8 @3xl:pr-0 @3xl:pl-8">
+        <div class="min-w-0 flex-1 px-4 pt-4 pb-28 md:px-8 md:pt-6">
           <div
             v-if="config.service_restart_required"
             class="mb-3 rounded-md border border-blue-500/30 bg-blue-500/10 px-4 py-2.5 text-sm text-blue-200"
@@ -486,7 +423,8 @@ async function saveConfig(): Promise<void> {
             {{ t('settings.pendingManagement') }}
           </div>
 
-          <h3 class="mb-2 text-base font-semibold text-white">{{ t(current.label) }}</h3>
+          <h3 class="text-base font-semibold text-white">{{ t(current.label) }}</h3>
+          <p class="mt-1 mb-2 text-sm text-gray-500">{{ t(current.description) }}</p>
 
           <template v-if="section === 'service'">
             <SettingRow
@@ -498,17 +436,6 @@ async function saveConfig(): Promise<void> {
               :env="environmentKey('auto_start')"
             >
               <UiSwitch id="setting-auto-start" v-model="form.auto_start" />
-            </SettingRow>
-            <SettingRow
-              v-if="desktopPlatform === 'darwin'"
-              :label="t('settings.hideDockIcon')"
-              control-id="setting-hide-dock-icon"
-              :description="t('settings.hideDockIconHelp')"
-              effect="immediate"
-              :changed="changedFields.has('hide_dock_icon')"
-              :env="environmentKey('hide_dock_icon')"
-            >
-              <UiSwitch id="setting-hide-dock-icon" v-model="form.hide_dock_icon" />
             </SettingRow>
             <SettingRow
               :label="t('settings.listen')"
@@ -548,17 +475,7 @@ async function saveConfig(): Promise<void> {
                 spellcheck="false"
               />
               <p
-                v-if="previewFallback"
-                class="mt-1 flex items-start gap-1.5 text-xs [overflow-wrap:anywhere] text-yellow-300"
-              >
-                <UiIcon name="warning" :size="14" class="mt-px shrink-0" />{{
-                  t('settings.previewFallback')
-                    .replace('{configured}', config.preview_listen_addr)
-                    .replace('{active}', config.active_preview_listen_addr)
-                }}
-              </p>
-              <p
-                v-else-if="form.preview_listen_addr !== config.active_preview_listen_addr"
+                v-if="form.preview_listen_addr !== config.active_preview_listen_addr"
                 class="mt-1 text-xs break-all text-gray-500"
               >
                 {{ t('settings.activeValue') }}: {{ config.active_preview_listen_addr }}
@@ -616,8 +533,6 @@ async function saveConfig(): Promise<void> {
                     >{{ revealKey ? key : maskKey(key) }}</span
                   >
                   <FilterMenu
-                    field
-                    class="rounded-md border border-line bg-canvas px-2 py-1.5 text-xs text-gray-200"
                     :label="keyAccountsLabel(key)"
                     :options="accounts.map((account) => account.id)"
                     :selected="keyBindings.get(key) ?? []"
@@ -638,18 +553,19 @@ async function saveConfig(): Promise<void> {
               :changed="changedFields.has('auth_states')"
               :env="environmentKey('auth_states')"
             >
-              <PathList
-                input-id="setting-auth-path"
-                :input-class="inputClass"
-                :value="form.auth_states"
-                @change="form.auth_states = $event"
+              <input
+                id="setting-auth-path"
+                v-model.trim="form.auth_states"
+                :class="inputClass"
+                autocomplete="off"
+                spellcheck="false"
               />
             </SettingRow>
             <SettingRow
               :label="t('settings.mediaOutput')"
               control-id="setting-media-output"
               :description="t('settings.mediaOutputHelp')"
-              effect="immediate"
+              effect="service"
               :changed="changedFields.has('media_output')"
               :env="environmentKey('media_output')"
             >
@@ -663,7 +579,7 @@ async function saveConfig(): Promise<void> {
               :label="t('settings.mediaBaseURL')"
               control-id="setting-media-base-url"
               :description="t('settings.mediaBaseURLHelp')"
-              effect="immediate"
+              effect="service"
               :changed="changedFields.has('media_base_url')"
               :env="environmentKey('media_base_url')"
             >
@@ -680,59 +596,69 @@ async function saveConfig(): Promise<void> {
 
           <template v-else-if="section === 'capacity'">
             <SettingRow
-              :label="t('settings.workerCapacity')"
-              group-id="setting-capacity"
-              :description="t('settings.workerCapacityHelp')"
+              :label="t('settings.warmWorkerLimit')"
+              control-id="setting-warm"
+              :description="t('settings.warmWorkerLimitHelp')"
               effect="immediate"
-              :changed="capacityItems.some((item) => changedFields.has(item.field))"
-              :env-note="capacityLocked"
+              :changed="changedFields.has('warm_worker_limit')"
+              :env="environmentKey('warm_worker_limit')"
             >
-              <div role="group" aria-labelledby="setting-capacity-label" class="space-y-3">
-                <SliderRoot
-                  :model-value="[form.warm_worker_limit, form.max_active_workers]"
-                  :min="1"
-                  :max="capacityLimit"
-                  :step="1"
-                  thumb-alignment="overflow"
-                  :disabled="
-                    environmentKey('warm_worker_limit') !== undefined ||
-                    environmentKey('max_active_workers') !== undefined
-                  "
-                  class="relative flex h-5 w-full touch-none items-center select-none data-[disabled]:opacity-50"
-                  @update:model-value="setWorkerRange"
-                >
-                  <SliderTrack class="relative h-1 grow rounded-full bg-line">
-                    <SliderRange class="absolute h-full rounded-full bg-blue-500" />
-                  </SliderTrack>
-                  <SliderThumb
-                    class="block h-3.5 w-3.5 rounded-full bg-gray-100 transition-transform hover:scale-110 focus-visible:ring-2 focus-visible:ring-gray-400 focus-visible:outline-none"
-                    :aria-label="t('settings.warmWorkerLimit')"
-                  />
-                  <SliderThumb
-                    class="block h-3.5 w-3.5 rounded-full bg-gray-100 transition-transform hover:scale-110 focus-visible:ring-2 focus-visible:ring-gray-400 focus-visible:outline-none"
-                    :aria-label="t('settings.maxActiveWorkers')"
-                  />
-                </SliderRoot>
-                <div class="grid grid-cols-2 gap-x-2 gap-y-2">
-                  <label
-                    v-for="item in capacityItems"
-                    :key="item.field"
-                    :for="`setting-${item.field}`"
-                    class="flex flex-col justify-between text-xs text-gray-400"
-                  >
-                    {{ t(item.label) }}
-                    <input
-                      :id="`setting-${item.field}`"
-                      v-model.number="form[item.field]"
-                      :class="[inputClass, 'mt-1.5 disabled:opacity-50']"
-                      type="number"
-                      min="1"
-                      :disabled="environmentKey(item.field) !== undefined"
-                    />
-                  </label>
-                </div>
-                <p class="text-xs text-gray-500">{{ capacitySummary }}</p>
-              </div>
+              <input
+                id="setting-warm"
+                v-model.number="form.warm_worker_limit"
+                :class="inputClass"
+                type="number"
+                min="1"
+              />
+            </SettingRow>
+            <SettingRow
+              :label="t('settings.maxActiveWorkers')"
+              control-id="setting-max"
+              :description="t('settings.maxActiveWorkersHelp')"
+              effect="immediate"
+              :changed="changedFields.has('max_active_workers')"
+              :env="environmentKey('max_active_workers')"
+            >
+              <input
+                id="setting-max"
+                v-model.number="form.max_active_workers"
+                :class="inputClass"
+                type="number"
+                :min="form.warm_worker_limit"
+              />
+            </SettingRow>
+            <SettingRow
+              :label="t('settings.warmStartupConcurrency')"
+              control-id="setting-startup"
+              :description="t('settings.warmStartupConcurrencyHelp')"
+              effect="immediate"
+              :changed="changedFields.has('warm_startup_concurrency')"
+              :env="environmentKey('warm_startup_concurrency')"
+            >
+              <input
+                id="setting-startup"
+                v-model.number="form.warm_startup_concurrency"
+                :class="inputClass"
+                type="number"
+                min="1"
+                :max="form.max_active_workers"
+              />
+            </SettingRow>
+            <SettingRow
+              :label="t('settings.perAccountConcurrency')"
+              control-id="setting-per-account"
+              :description="t('settings.perAccountConcurrencyHelp')"
+              effect="immediate"
+              :changed="changedFields.has('per_account_concurrency')"
+              :env="environmentKey('per_account_concurrency')"
+            >
+              <input
+                id="setting-per-account"
+                v-model.number="form.per_account_concurrency"
+                :class="inputClass"
+                type="number"
+                min="1"
+              />
             </SettingRow>
             <SettingRow
               :label="t('settings.routingStrategy')"
@@ -747,190 +673,52 @@ async function saveConfig(): Promise<void> {
                 <option value="fill-first">{{ t('settings.routingFillFirst') }}</option>
               </UiSelect>
             </SettingRow>
-            <SettingRow
-              v-if="form.routing_strategy === 'fill-first' && accounts.length > 1"
-              :label="t('settings.accountOrder')"
-              group-id="setting-account-order"
-              :description="t('settings.accountOrderHelp')"
-              effect="immediate"
-              :changed="changedFields.has('account_order')"
-              :env="environmentKey('account_order')"
-            >
-              <AccountOrderList
-                :accounts="accounts"
-                :value="form.account_order ?? ''"
-                @change="form.account_order = $event"
-              />
-            </SettingRow>
-            <SettingRow
-              :label="t('settings.maxAccountSwitches')"
-              control-id="setting-max-account-switches"
-              :description="t('settings.maxAccountSwitchesHelp')"
-              effect="immediate"
-              :changed="changedFields.has('max_account_switches')"
-              :env="environmentKey('max_account_switches')"
-            >
-              <input
-                id="setting-max-account-switches"
-                v-model.number="form.max_account_switches"
-                :class="inputClass"
-                type="number"
-                min="0"
-              />
-            </SettingRow>
           </template>
 
-          <template v-else-if="section === 'runtime'">
+          <template v-else-if="section === 'upstream'">
             <SettingRow
-              :label="t('settings.waaBackend')"
-              control-id="setting-waa-backend"
-              :description="t('settings.waaBackendHelp')"
-              effect="service"
-              :changed="changedFields.has('waa_backend')"
-              :env="environmentKey('waa_backend')"
-            >
-              <UiSelect id="setting-waa-backend" v-model="form.waa_backend" :class="inputClass">
-                <option
-                  v-for="option in waaBackendOptions"
-                  :key="option.value"
-                  :value="option.value"
-                >
-                  {{ t(option.label) }}
-                </option>
-              </UiSelect>
-            </SettingRow>
-            <SettingRow
-              v-for="channel in upstreamChannelOptions"
-              :key="channel"
-              :label="t('settings.channelRow').replace('{channel}', t(channelLabelKey(channel)))"
-              :control-id="`setting-channel-${channel}`"
+              :label="t('settings.upstreamChannels')"
+              group-id="setting-channels"
               :description="t('settings.upstreamChannelsHelp')"
               effect="service"
-              :changed="
-                changedFields.has('upstream_channels') &&
-                form.upstream_channels.includes(channel) !==
-                  config?.upstream_channels.includes(channel)
-              "
+              :changed="changedFields.has('upstream_channels')"
               :env="environmentKey('upstream_channels')"
             >
-              <template v-if="channel === 'build'" #tag>
-                <span class="text-xs text-gray-500">{{ t('settings.legacy') }}</span>
-              </template>
-              <template
-                v-if="channel === 'build' && form.upstream_channels.includes('build')"
-                #note
+              <div
+                role="group"
+                aria-labelledby="setting-channels-label"
+                class="grid grid-cols-2 gap-2"
               >
-                <p class="mt-1 flex items-start gap-1.5 text-xs leading-5 text-gray-400">
-                  <UiIcon name="warning" :size="13" class="mt-1 text-amber-400" />
-                  {{ t('settings.buildLegacyNotice') }}
-                </p>
-              </template>
-              <UiSwitch
-                :id="`setting-channel-${channel}`"
-                :model-value="form.upstream_channels.includes(channel)"
-                :disabled="
-                  form.upstream_channels.length === 1 && form.upstream_channels.includes(channel)
-                "
-                @update:model-value="toggleUpstreamChannel(channel, $event)"
-              />
-            </SettingRow>
-            <SettingRow
-              v-if="form.upstream_channels.includes('build')"
-              :label="t('settings.buildNative')"
-              control-id="setting-build-native"
-              :description="t('settings.buildNativeHelp')"
-              effect="service"
-              :changed="changedFields.has('build_native_nonstream')"
-              :env="environmentKey('build_native_nonstream')"
-            >
-              <UiSwitch id="setting-build-native" v-model="form.build_native_nonstream" />
-            </SettingRow>
-            <SettingRow
-              :label="t('settings.initTimeout')"
-              control-id="setting-init-timeout"
-              :description="t('settings.initTimeoutHelp')"
-              effect="service"
-              :changed="changedFields.has('init_timeout')"
-              :env="environmentKey('init_timeout')"
-            >
-              <DurationInput
-                id="setting-init-timeout"
-                v-model="form.init_timeout"
-                :input-class="inputClass"
-              />
-            </SettingRow>
-            <SettingRow
-              :label="t('settings.requestTimeout')"
-              control-id="setting-request-timeout"
-              :description="t('settings.requestTimeoutHelp')"
-              effect="service"
-              :changed="changedFields.has('request_timeout')"
-              :env="environmentKey('request_timeout')"
-            >
-              <DurationInput
-                id="setting-request-timeout"
-                v-model="form.request_timeout"
-                :input-class="inputClass"
-              />
-            </SettingRow>
-            <SettingRow
-              :label="t('settings.firstEventHedge')"
-              control-id="setting-first-event-hedge"
-              :description="hedgeDescription"
-              effect="service"
-              :changed="changedFields.has('first_event_hedge')"
-              :env="environmentKey('first_event_hedge')"
-            >
-              <UiSelect id="setting-first-event-hedge" v-model="hedgeMode" :class="inputClass">
-                <option value="off">{{ t('settings.firstEventHedgeOff') }}</option>
-                <option value="auto">{{ t('settings.firstEventHedgeAuto') }}</option>
-                <option value="custom">{{ t('settings.firstEventHedgeCustom') }}</option>
-              </UiSelect>
-              <div v-if="hedgeMode === 'custom'" class="mt-2 flex items-center gap-2">
-                <input
-                  id="setting-first-event-hedge-seconds"
-                  v-model.trim="form.first_event_hedge"
-                  :class="inputClass"
-                  :aria-label="t('settings.firstEventHedgeSeconds')"
-                  inputmode="numeric"
-                  autocomplete="off"
-                />
-                <span class="shrink-0 text-sm text-gray-400">{{
-                  t('settings.firstEventHedgeUnit')
-                }}</span>
+                <label
+                  v-for="channel in upstreamChannelOptions"
+                  :key="channel"
+                  class="flex h-9 cursor-pointer items-center gap-2.5 rounded-md border px-3 text-sm transition-colors has-[:disabled]:cursor-default"
+                  :class="
+                    form.upstream_channels.includes(channel)
+                      ? 'border-blue-500/60 bg-blue-500/10 text-gray-100'
+                      : 'border-line bg-canvas text-gray-400 hover:border-gray-600 hover:text-gray-200'
+                  "
+                >
+                  <input
+                    type="checkbox"
+                    :checked="form.upstream_channels.includes(channel)"
+                    :disabled="
+                      form.upstream_channels.length === 1 &&
+                      form.upstream_channels.includes(channel)
+                    "
+                    @change="
+                      toggleUpstreamChannel(channel, ($event.target as HTMLInputElement).checked)
+                    "
+                  />
+                  {{ t(channelLabelKey(channel)) }}
+                </label>
               </div>
-              <p v-if="hedgeHint" class="mt-2 text-xs leading-5 text-gray-500">{{ hedgeHint }}</p>
             </SettingRow>
-            <SettingRow
-              :label="t('settings.firstEventHedgeModels')"
-              group-id="setting-first-event-hedge-models"
-              :description="t('settings.firstEventHedgeModelsHelp')"
-              effect="service"
-              :changed="changedFields.has('first_event_hedge_models')"
-              :env="environmentKey('first_event_hedge_models')"
-            >
-              <FilterMenu
-                field
-                :class="inputClass"
-                :label="hedgeModelsLabel"
-                :options="modelIDs"
-                :selected="hedgeModels"
-                :format="(id: string) => id"
-                :search-label="t('settings.modelSearch')"
-                :empty-label="t('settings.modelNone')"
-                :clear-label="t('settings.selectionClear')"
-                @change="form.first_event_hedge_models = $event.join(',')"
-              />
-            </SettingRow>
-          </template>
-
-          <template v-else-if="section === 'models'">
             <SettingRow
               :label="t('settings.modelMapping')"
               group-id="setting-model-mapping"
-              wide
               :description="t('settings.modelMappingHelp')"
-              effect="immediate"
+              effect="service"
               :changed="changedFields.has('model_mapping')"
               :env="environmentKey('model_mapping')"
             >
@@ -948,7 +736,6 @@ async function saveConfig(): Promise<void> {
             <SettingRow
               :label="t('settings.modelChannels')"
               group-id="setting-model-channels"
-              wide
               :description="t('settings.modelChannelsHelp')"
               effect="immediate"
               :changed="changedFields.has('model_channels')"
@@ -967,10 +754,20 @@ async function saveConfig(): Promise<void> {
               />
             </SettingRow>
             <SettingRow
+              :label="t('settings.buildNative')"
+              control-id="setting-build-native"
+              :description="t('settings.buildNativeHelp')"
+              effect="service"
+              :changed="changedFields.has('build_native_nonstream')"
+              :env="environmentKey('build_native_nonstream')"
+            >
+              <UiSwitch id="setting-build-native" v-model="form.build_native_nonstream" />
+            </SettingRow>
+            <SettingRow
               :label="t('settings.nonstreamKeepalive')"
               control-id="setting-nonstream-keepalive"
               :description="t('settings.nonstreamKeepaliveHelp')"
-              effect="immediate"
+              effect="service"
               :changed="changedFields.has('nonstream_keepalive')"
               :env="environmentKey('nonstream_keepalive')"
             >
@@ -980,7 +777,7 @@ async function saveConfig(): Promise<void> {
               :label="t('settings.fakeStream')"
               control-id="setting-fake-stream"
               :description="t('settings.fakeStreamHelp')"
-              effect="immediate"
+              effect="service"
               :changed="changedFields.has('fake_stream')"
               :env="environmentKey('fake_stream')"
             >
@@ -1000,27 +797,17 @@ async function saveConfig(): Promise<void> {
               :label="t('settings.searchModelAliases')"
               control-id="setting-search-model-aliases"
               :description="t('settings.searchModelAliasesHelp')"
-              effect="immediate"
+              effect="service"
               :changed="changedFields.has('search_model_aliases')"
               :env="environmentKey('search_model_aliases')"
             >
               <UiSwitch id="setting-search-model-aliases" v-model="form.search_model_aliases" />
             </SettingRow>
             <SettingRow
-              :label="t('settings.discoverHiddenModels')"
-              control-id="setting-discover-hidden-models"
-              :description="t('settings.discoverHiddenModelsHelp')"
-              effect="service"
-              :changed="changedFields.has('discover_hidden_models')"
-              :env="environmentKey('discover_hidden_models')"
-            >
-              <UiSwitch id="setting-discover-hidden-models" v-model="form.discover_hidden_models" />
-            </SettingRow>
-            <SettingRow
               :label="t('settings.googleSearch')"
               control-id="setting-google-search"
               :description="t('settings.googleSearchHelp')"
-              effect="immediate"
+              effect="service"
               :changed="changedFields.has('google_search')"
               :env="environmentKey('google_search')"
             >
@@ -1064,6 +851,94 @@ async function saveConfig(): Promise<void> {
               <UiSwitch
                 id="setting-strip-thought-signatures"
                 v-model="form.strip_thought_signatures"
+              />
+            </SettingRow>
+            <SettingRow
+              :label="t('settings.waaBackend')"
+              control-id="setting-waa-backend"
+              :description="t('settings.waaBackendHelp')"
+              effect="service"
+              :changed="changedFields.has('waa_backend')"
+              :env="environmentKey('waa_backend')"
+            >
+              <UiSelect id="setting-waa-backend" v-model="form.waa_backend" :class="inputClass">
+                <option value="camoufox">{{ t('settings.waaBackendCamoufox') }}</option>
+                <option value="spidermonkey">{{ t('settings.waaBackendSpiderMonkey') }}</option>
+              </UiSelect>
+            </SettingRow>
+            <SettingRow
+              :label="t('settings.initTimeout')"
+              control-id="setting-init-timeout"
+              :description="t('settings.initTimeoutHelp')"
+              effect="service"
+              :changed="changedFields.has('init_timeout')"
+              :env="environmentKey('init_timeout')"
+            >
+              <DurationInput
+                id="setting-init-timeout"
+                v-model="form.init_timeout"
+                :input-class="inputClass"
+              />
+            </SettingRow>
+            <SettingRow
+              :label="t('settings.requestTimeout')"
+              control-id="setting-request-timeout"
+              :description="t('settings.requestTimeoutHelp')"
+              effect="service"
+              :changed="changedFields.has('request_timeout')"
+              :env="environmentKey('request_timeout')"
+            >
+              <DurationInput
+                id="setting-request-timeout"
+                v-model="form.request_timeout"
+                :input-class="inputClass"
+              />
+            </SettingRow>
+            <SettingRow
+              :label="t('settings.firstEventHedge')"
+              control-id="setting-first-event-hedge"
+              :description="t('settings.firstEventHedgeHelp')"
+              effect="service"
+              :changed="changedFields.has('first_event_hedge')"
+              :env="environmentKey('first_event_hedge')"
+            >
+              <UiSelect id="setting-first-event-hedge" v-model="hedgeMode" :class="inputClass">
+                <option value="off">{{ t('settings.firstEventHedgeOff') }}</option>
+                <option value="auto">{{ t('settings.firstEventHedgeAuto') }}</option>
+                <option value="custom">{{ t('settings.firstEventHedgeCustom') }}</option>
+              </UiSelect>
+              <div v-if="hedgeMode === 'custom'" class="mt-2 flex items-center gap-2">
+                <input
+                  id="setting-first-event-hedge-seconds"
+                  v-model.trim="form.first_event_hedge"
+                  :class="inputClass"
+                  :aria-label="t('settings.firstEventHedgeSeconds')"
+                  inputmode="numeric"
+                  autocomplete="off"
+                />
+                <span class="shrink-0 text-sm text-gray-400">{{
+                  t('settings.firstEventHedgeUnit')
+                }}</span>
+              </div>
+              <p v-if="hedgeHint" class="mt-2 text-xs leading-5 text-gray-500">{{ hedgeHint }}</p>
+            </SettingRow>
+            <SettingRow
+              :label="t('settings.firstEventHedgeModels')"
+              group-id="setting-first-event-hedge-models"
+              :description="t('settings.firstEventHedgeModelsHelp')"
+              effect="service"
+              :changed="changedFields.has('first_event_hedge_models')"
+              :env="environmentKey('first_event_hedge_models')"
+            >
+              <FilterMenu
+                :label="hedgeModelsLabel"
+                :options="modelIDs"
+                :selected="hedgeModels"
+                :format="(id: string) => id"
+                :search-label="t('settings.modelSearch')"
+                :empty-label="t('settings.modelNone')"
+                :clear-label="t('settings.selectionClear')"
+                @change="form.first_event_hedge_models = $event.join(',')"
               />
             </SettingRow>
           </template>
@@ -1210,6 +1085,7 @@ async function saveConfig(): Promise<void> {
           role="region"
           :aria-label="t('settings.unsavedBar')"
         >
+          <span class="h-2 w-2 shrink-0 rounded-full bg-amber-400"></span>
           <span class="flex-1 text-sm text-gray-300">
             {{
               t(changedCount === 1 ? 'settings.unsavedCountOne' : 'settings.unsavedCount').replace(

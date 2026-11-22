@@ -1,24 +1,18 @@
 <script setup lang="ts">
-import { computed, onActivated, onMounted, onUnmounted, ref, useTemplateRef, watch } from 'vue'
+import { computed, onActivated, onUnmounted, ref, useTemplateRef, watch } from 'vue'
 import { api } from '@/api'
 import { useI18n } from '@/i18n'
 import { markdown } from '@/markdown'
-import type { UpdateProgress, UpdateStatus } from '@/types'
+import type { UpdateStatus } from '@/types'
 import UiIcon from '@/components/UiIcon.vue'
 
-const props = defineProps<{
-  status: UpdateStatus | null
-  activeRequests: number
-  restartStalled: boolean
-}>()
+const props = defineProps<{ status: UpdateStatus | null; activeRequests: number }>()
 const emit = defineEmits<{ status: [UpdateStatus]; restarting: [] }>()
 const { t, locale, errorText, logText } = useI18n()
 const checking = ref(false)
 const confirming = ref(false)
 const phase = ref<'idle' | 'installing' | 'restarting'>('idle')
 const error = ref('')
-// progress 是安装期间最近一次读到的更新阶段与下载字节数
-const progress = ref<UpdateProgress | null>(null)
 
 const latest = computed(() => props.status?.latest ?? '')
 const notes = computed(() => markdown.render(props.status?.notes ?? ''))
@@ -39,8 +33,7 @@ function revealNotes(): void {
   }
   revealFrame = requestAnimationFrame(next)
 }
-watch(notes, revealNotes, { flush: 'post' })
-onMounted(revealNotes)
+watch(notes, revealNotes, { flush: 'post', immediate: true })
 onUnmounted(() => cancelAnimationFrame(revealFrame))
 const publishedAt = computed(() =>
   props.status?.published_at
@@ -51,36 +44,11 @@ const installable = computed(
   () => props.status?.mode === 'binary' && props.status.available && !props.status.updating,
 )
 const summary = computed(() => {
-  if (phase.value === 'installing')
-    return t(
-      progress.value?.stage === 'verify'
-        ? 'version.verifying'
-        : progress.value?.stage === 'install'
-          ? 'version.installing'
-          : 'version.downloading',
-    )
-  if (phase.value === 'restarting') return props.restartStalled ? '' : t('version.restarting')
+  if (phase.value === 'installing') return t('version.installing')
+  if (phase.value === 'restarting') return t('version.restarting')
   if (props.status?.available) return t('version.available').replace('{version}', latest.value)
   if (latest.value) return t('version.upToDate')
   return ''
-})
-// percent 是发行包的下载百分比，总大小未知时为 null
-const percent = computed(() => {
-  const value = progress.value
-  if (!value || value.total <= 0) return null
-  return value.stage === 'download' ? Math.floor((value.downloaded / value.total) * 100) : 100
-})
-// sizeText 是已下载与总大小，按界面语言格式化为 MB
-const sizeText = computed(() => {
-  const value = progress.value
-  if (!value) return ''
-  const format = new Intl.NumberFormat(locale.value, {
-    style: 'unit',
-    unit: 'megabyte',
-    maximumFractionDigits: 1,
-  })
-  const done = format.format(value.downloaded / 1e6)
-  return value.total > 0 ? `${done} / ${format.format(value.total / 1e6)}` : done
 })
 const confirmText = computed(() =>
   t('version.confirmText')
@@ -101,25 +69,17 @@ async function check(refresh: boolean): Promise<void> {
   }
 }
 
-// install 下载并替换为最新版本，期间每 250 ms 读取一次更新进度，成功后通知上层等待重启
+// install 下载并替换为最新版本，成功后通知上层等待重启
 async function install(): Promise<void> {
   confirming.value = false
   phase.value = 'installing'
-  progress.value = null
   error.value = ''
-  const timer = setInterval(() => {
-    api.updateStatus().then((status) => {
-      if (phase.value === 'installing' && status.progress) progress.value = status.progress
-    })
-  }, 250)
   try {
     emit('status', await api.applyUpdate())
   } catch (reason) {
     phase.value = 'idle'
     error.value = errorText(reason)
     return
-  } finally {
-    clearInterval(timer)
   }
   phase.value = 'restarting'
   emit('restarting')
@@ -130,20 +90,18 @@ onActivated(() => void check(false))
 
 <template>
   <section
-    class="flex min-h-0 flex-1 flex-col overflow-auto max-md:[scrollbar-gutter:stable] md:overflow-hidden"
+    class="flex min-h-0 flex-1 flex-col overflow-auto [scrollbar-gutter:stable] md:overflow-hidden"
   >
     <header
-      class="page-x flex flex-wrap items-center gap-3 border-b border-line py-4 md:overflow-hidden md:[scrollbar-gutter:stable]"
+      class="flex flex-wrap items-center gap-3 border-b border-line px-4 py-4 md:px-[max(2rem,calc((100%_-_var(--container-4xl))/2_+_2rem))]"
     >
       <div class="min-w-0 flex-1">
         <h2 class="text-xl font-semibold text-white">{{ t('section.version.title') }}</h2>
         <p class="mt-1 text-sm text-gray-500">{{ t('section.version.description') }}</p>
       </div>
     </header>
-    <div
-      class="page-x flex min-h-0 flex-1 flex-col py-4 md:overflow-hidden md:py-8 md:[scrollbar-gutter:stable]"
-    >
-      <article class="shrink-0 rounded-lg border border-line bg-panel p-4">
+    <div class="mx-auto flex min-h-0 w-full max-w-4xl flex-1 flex-col p-4 md:p-8">
+      <article class="shrink-0 rounded-lg border border-line bg-panel p-4 md:p-6">
         <dl class="grid gap-4 sm:grid-cols-2">
           <div>
             <dt class="text-xs text-gray-500">{{ t('version.current') }}</dt>
@@ -166,28 +124,6 @@ onActivated(() => void check(false))
         >
           {{ summary }}
         </p>
-        <div v-if="phase === 'installing'" class="mt-3">
-          <div
-            role="progressbar"
-            :aria-label="summary"
-            aria-valuemin="0"
-            aria-valuemax="100"
-            :aria-valuenow="percent ?? undefined"
-            :aria-valuetext="sizeText || undefined"
-            class="h-1.5 overflow-hidden rounded-full bg-raised"
-          >
-            <div
-              v-if="percent !== null"
-              class="h-full rounded-full bg-blue-500 transition-[width] duration-200 ease-out"
-              :style="{ width: `${percent}%` }"
-            />
-            <div v-else class="update-indeterminate h-full w-1/3 rounded-full bg-blue-500" />
-          </div>
-          <p class="mt-2 flex justify-between font-mono text-xs text-gray-400 tabular-nums">
-            <span>{{ sizeText }}</span>
-            <span v-if="percent !== null">{{ percent }}%</span>
-          </p>
-        </div>
 
         <div class="mt-4 flex flex-wrap items-center gap-2">
           <button
@@ -260,23 +196,19 @@ onActivated(() => void check(false))
         </p>
 
         <p
-          v-if="restartStalled || error || status?.error"
+          v-if="error || status?.error"
           role="alert"
           class="mt-4 rounded border border-red-500/40 bg-red-500/10 p-3 text-sm break-words text-red-300"
         >
-          {{
-            restartStalled
-              ? t('version.restartStalled').replace('{path}', status?.log_dir ?? '')
-              : error || logText(status?.error ?? '')
-          }}
+          {{ error || logText(status?.error ?? '') }}
         </p>
       </article>
 
       <article
         v-if="status?.notes"
-        class="mt-4 flex min-h-0 flex-1 flex-col rounded-lg border border-line bg-panel p-4"
+        class="mt-6 flex min-h-0 flex-1 flex-col rounded-lg border border-line bg-panel p-4 md:p-6"
       >
-        <h3 class="text-sm font-semibold text-gray-200">
+        <h3 class="font-bold text-gray-300">
           {{ t('version.notes').replace('{version}', latest) }}
         </h3>
         <div
@@ -288,22 +220,3 @@ onActivated(() => void check(false))
     </div>
   </section>
 </template>
-
-<style scoped>
-.update-indeterminate {
-  animation: update-indeterminate 1.2s ease-in-out infinite;
-}
-@keyframes update-indeterminate {
-  from {
-    transform: translateX(-100%);
-  }
-  to {
-    transform: translateX(300%);
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  .update-indeterminate {
-    animation: none;
-  }
-}
-</style>

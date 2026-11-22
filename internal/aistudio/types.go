@@ -390,32 +390,6 @@ type AgentConfig struct {
 	CollaborativePlanning bool   `json:"collaborative_planning,omitempty"`
 }
 
-// AgentEnvironment 是 Interactions API 的 environment：ID 为已有环境，Sources 为挂载到环境中的源，Allowlist 为出站白名单
-type AgentEnvironment struct {
-	ID      string              `json:"id,omitempty"`
-	Sources []EnvironmentSource `json:"sources,omitempty"`
-	// Allowlist 为空时新环境按官网默认禁止出站，已有环境保持原网络设置
-	Allowlist []EgressRule `json:"allowlist,omitempty"`
-	// NetworkDisabled 表示禁止全部出站
-	NetworkDisabled bool `json:"network_disabled,omitempty"`
-}
-
-// EnvironmentSource 是挂载到环境中的一个源，Type 为 gcs、inline 或 repository
-type EnvironmentSource struct {
-	Type     string `json:"type"`
-	Source   string `json:"source,omitempty"`
-	Target   string `json:"target,omitempty"`
-	Content  string `json:"content,omitempty"`
-	Encoding string `json:"encoding,omitempty"`
-}
-
-// EgressRule 是出站白名单的一条规则，Headers 为注入匹配请求的请求头，Credential 为服务端凭据 ID
-type EgressRule struct {
-	Domain     string            `json:"domain"`
-	Headers    map[string]string `json:"headers,omitempty"`
-	Credential string            `json:"credential,omitempty"`
-}
-
 // GenerateRequest 表示供应商无关的生成请求
 type GenerateRequest struct {
 	ID    string `json:"id"`
@@ -436,10 +410,10 @@ type GenerateRequest struct {
 	Labels map[string]string `json:"labels,omitempty"`
 	// AgentConfig 是 agent 的运行配置
 	AgentConfig *AgentConfig `json:"agent_config,omitempty"`
-	// Environment 是 agent 的远程环境，nil 时为官网默认的新环境
-	Environment *AgentEnvironment `json:"environment,omitempty"`
 	// PreviousInteractionID 是上一轮 agent 后台任务的上游 interaction ID，有值时只发送上一模型轮之后的输入
 	PreviousInteractionID string `json:"previous_interaction_id,omitempty"`
+	// AntiCensor 内部标记：请求使用 -uncut 抗审查包装
+	AntiCensor bool `json:"-"`
 	// ImageRoute 内部标记：图像生成模型（由模型目录能力推导）
 	ImageRoute bool `json:"-"`
 	// Unary 标记单次非流式请求（在 Build 代理中使用 ProxyUnaryCall）
@@ -448,20 +422,14 @@ type GenerateRequest struct {
 	Background bool `json:"-"`
 	// Truncate 在生成前按模型上下文窗口移除最早的完整轮次
 	Truncate bool `json:"-"`
-	// KeepAbnormalFinish 表示异常结束重新生成耗尽且没有输出时仍以该结束原因结束，供按官方形状输出的 Gemini 入口使用
-	KeepAbnormalFinish bool `json:"-"`
 	// continuationRound 为自动续写的轮次，首轮为 0
 	continuationRound int
 	// continuationToken 为上一轮响应给出的续写 token
 	continuationToken string
-	// continuationProof 为首轮请求写入的 WAA proof，各续写轮沿用
-	continuationProof string
 	// restoreModelTurns 表示 Playground 请求按本进程保存的生成结果补回历史模型轮
 	restoreModelTurns bool
 	// turnToken 为历史中最后一个模型轮的轮次令牌
 	turnToken string
-	// turnChain 为恢复历史后的对话与其末尾一组轮次的累积摘要
-	turnChain turnChain
 }
 
 // TokenCountRequest 表示计数请求
@@ -532,8 +500,6 @@ type Model struct {
 	Channels    []string   `json:"channels,omitempty"`
 	// AgentModel 是 agent 默认使用的模型 ID
 	AgentModel string `json:"agent_model,omitempty"`
-	// Hidden 表示官网前端已配置、ListModels 尚未列出、经 CountTokens 确认可用的模型
-	Hidden bool `json:"hidden,omitempty"`
 }
 
 // ThinkingBudget 是 ListModels field 72 的思考预算配置
@@ -695,15 +661,13 @@ const (
 type Event struct {
 	Kind EventKind `json:"kind"`
 	Part
-	Grounding    *GroundingMetadata `json:"grounding,omitempty"`
-	Citation     *Citation          `json:"citation,omitempty"`
-	Usage        *Usage             `json:"usage,omitempty"`
-	FinishReason string             `json:"finish_reason,omitempty"`
-	// EnvironmentID 是 agent 交互结束时返回的远程环境 ID
-	EnvironmentID string `json:"environment_id,omitempty"`
-	FinishMessage string `json:"finish_message,omitempty"`
-	StopSequence  string `json:"stop_sequence,omitempty"`
-	ProviderModel string `json:"provider_model,omitempty"`
+	Grounding     *GroundingMetadata `json:"grounding,omitempty"`
+	Citation      *Citation          `json:"citation,omitempty"`
+	Usage         *Usage             `json:"usage,omitempty"`
+	FinishReason  string             `json:"finish_reason,omitempty"`
+	FinishMessage string             `json:"finish_message,omitempty"`
+	StopSequence  string             `json:"stop_sequence,omitempty"`
+	ProviderModel string             `json:"provider_model,omitempty"`
 	// SafetyRatings 是结束事件携带的候选安全评级
 	SafetyRatings []SafetyRating `json:"safety_ratings,omitempty"`
 	// TurnToken 是上游响应帧的轮次令牌
@@ -722,8 +686,6 @@ type Event struct {
 	// FinishFrame 表示事件来自带结束原因的上游帧
 	FinishFrame bool  `json:"finish_frame,omitempty"`
 	Err         error `json:"-"`
-	// TrailingError 是上游在函数调用之后结束生成的错误，结束事件仍按正常完成输出给客户端
-	TrailingError error `json:"-"`
 }
 
 // SafetyRating 是候选或输入在一个安全类别上的评级，取值为 Gemini API 枚举名

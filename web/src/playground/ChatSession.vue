@@ -30,9 +30,11 @@ const streamingIndex = computed(() => (session.running ? session.turns.length - 
 const renderBatch = 1
 // firstShown 是已渲染的第一个轮次下标
 const firstShown = ref(0)
+// eager 是首批轮次的下标范围 [起, 止)，这些轮次的正文块始终全部排版、不按视口跳过，打开对话滚到末尾时可见部分已是实际高度
+const eager = ref<[number, number]>([0, 0])
 let filling = 0
 let fillFrame = 0
-// codeFont 是代码块的字体，首批轮次等它载入或载入失败后才排版，代码按最终字体换行，之后不因字体晚到而改变高度
+// codeFont 是代码块的字体，首批轮次等它载入后才排版，代码按最终字体换行，之后不因字体晚到而改变高度
 const codeFont = '1em "Google Sans Code Variable"'
 
 // scheduleFill 在下一帧绘制之后的任务中向前多渲染一批，每批轮次的排版各在一帧里完成
@@ -40,42 +42,30 @@ function scheduleFill(first = false): void {
   fillFrame = requestAnimationFrame(() => (filling = window.setTimeout(() => void fill(first))))
 }
 
-// fill prepends batches from the end upward and preserves scrollTop when scrolled to the temporary top.
+// fill 向前多渲染一批轮次；首批不满一屏时在同一任务里继续向前补并滚到末尾，首次绘制即铺满可见区域，之后在可见区域上方每帧补一批，由浏览器的滚动锚定保持可见内容不动
 async function fill(first: boolean): Promise<void> {
-  if (first) await document.fonts.load(codeFont).catch(() => [])
-  const prevHeight = scroller.value?.scrollHeight ?? 0
-  const prevTop = scroller.value?.scrollTop ?? 0
+  if (first) await document.fonts.load(codeFont)
   firstShown.value = Math.max(0, firstShown.value - renderBatch)
+  if (first) eager.value = [firstShown.value, eager.value[1]]
   await nextTick()
   // 等待字体与更新期间切换对话时组件已卸载，补齐随之结束
   if (!scroller.value) return
-  const element = scroller.value
   if (first) {
+    const element = scroller.value
     if (firstShown.value > 0 && element.scrollHeight <= element.clientHeight) return fill(true)
     follow()
-  } else if (detached && prevTop <= 1 && element.scrollTop <= 1) {
-    const added = element.scrollHeight - prevHeight
-    if (added > 0) {
-      element.scrollTop += added
-      lastTop = element.scrollTop
-    }
   }
   if (firstShown.value > 0) scheduleFill()
 }
-// detached 表示用户向上滚动后停止跟随，回到底部时恢复；lastTop 是判断向上滚动的基准位置，跟随时为自动跟随设定的位置，停止跟随后与向下滚动时为当前位置；lastHeight 是当时的可见高度
-let detached = false
-let lastTop = 0
-let lastHeight = 0
 watch(
   () => session.turns,
   (turns) => {
     cancelAnimationFrame(fillFrame)
     window.clearTimeout(filling)
-    detached = false
     // 长对话的末尾一批也在下一帧之后渲染，不与打开对话时的页面更新挤在同一个任务里
     firstShown.value = turns.length > renderBatch ? turns.length : 0
+    eager.value = [turns.length, turns.length]
     if (firstShown.value > 0) scheduleFill(true)
-    else void nextTick(() => follow(true))
   },
   { immediate: true },
 )
@@ -112,54 +102,57 @@ const scrollbarItems = computed<ScrollbarItem[]>(() => {
   return items
 })
 
+// detached 表示用户向上滚动后停止跟随，回到底部时恢复；lastTop 是上一次滚动事件或自动跟随设定的位置，lastHeight 是当时的可见高度
+let detached = false
+let lastTop = 0
+let lastHeight = 0
 let scrollingTimer = 0
 const scrolled = ref(false)
 const scrollable = ref(false)
 const atBottom = ref(true)
 const userScrolling = ref(false)
 
-// measure records whether the conversation is scrollable and whether it sits at the bottom.
+// measure 记录对话是否可滚动、是否位于底部
 function measure(): void {
   const element = scroller.value!
   scrollable.value = element.scrollHeight > element.clientHeight
-  atBottom.value = element.scrollTop >= element.scrollHeight - element.clientHeight - 1
+  atBottom.value = element.scrollTop >= element.scrollHeight - element.clientHeight
 }
 
-// follow scrolls to the bottom unless detached; force re-attaches.
+// follow 与官网 ms-autoscroll-container 一致：没有停止跟随时滚到底部，force 先恢复跟随；内容变矮使位置被截短时同样记录新的底部
 function follow(force = false): void {
-  const element = scroller.value
-  if (!element) return
+  const element = scroller.value!
   if (force) detached = false
   if (detached) return
   const max = element.scrollHeight - element.clientHeight
   lastTop = max
   lastHeight = element.clientHeight
-  if (element.scrollTop >= max - 1) return
+  if (element.scrollTop >= max) return
   element.scrollTop = max
   atBottom.value = true
 }
 
-// onScroll detaches auto-follow on any upward scroll including subpixel steps and re-attaches at bottom.
+// onScroll 用户向上滚动任意距离即停止跟随，滚到底部恢复跟随；可见高度增加使位置被截短的距离不算向上滚动
 function onScroll(): void {
   const element = scroller.value!
   const max = element.scrollHeight - element.clientHeight
-  const rawTop = Math.max(0, element.scrollTop)
-  const bottom = rawTop >= max - 1
+  const top = Math.max(0, Math.floor(element.scrollTop))
+  const bottom = top >= max
   const grown = Math.max(0, element.clientHeight - lastHeight)
-  if (lastTop <= max && lastTop - rawTop > 1 + grown) detached = true
+  if (lastTop <= max && lastTop - top > 1 + grown) detached = true
   if (bottom) detached = false
-  if (detached || bottom || rawTop > lastTop) lastTop = bottom ? max : rawTop
+  lastTop = top
   lastHeight = element.clientHeight
-  scrolled.value = rawTop > 0
+  scrolled.value = top > 0
   atBottom.value = bottom
   userScrolling.value = true
   window.clearTimeout(scrollingTimer)
   scrollingTimer = window.setTimeout(() => (userScrolling.value = false), 200)
 }
 
-// resize 在内容或容器尺寸变化时跟随到底部，编辑轮次时不跳转滚动位置
+// resize 在内容或容器尺寸变化时跟随到底部
 const resize = new ResizeObserver(() => {
-  if (!content.value?.querySelector('.edit-textarea')) follow()
+  follow()
   measure()
 })
 // observe 观察对话内容与滚动容器的尺寸
@@ -171,8 +164,7 @@ function observe(): void {
 onMounted(observe)
 onDeactivated(() => resize.disconnect())
 onActivated(() => {
-  if (!scroller.value) return
-  scroller.value.scrollTop = lastTop
+  scroller.value!.scrollTop = lastTop
   observe()
 })
 watch(
@@ -219,6 +211,7 @@ onUnmounted(() => {
         <template v-for="(turn, index) in session.turns" :key="turn.id">
           <ChatTurn
             v-if="index >= firstShown && !responseTurn(index)"
+            :class="{ eager: index >= eager[0] && index < eager[1] }"
             :turn="turn"
             :index="index"
             :streaming="index === streamingIndex"
@@ -256,7 +249,7 @@ onUnmounted(() => {
   margin-top: 12px;
   overflow-y: auto;
   padding-top: var(--ms-autoscroll-container-padding-top);
-  container-type: inline-size;
+  container-type: size;
   outline: none;
   scrollbar-width: none;
 }
@@ -296,6 +289,10 @@ onUnmounted(() => {
 
 .side-by-side .chat-session-content {
   padding: 0 0 24px;
+}
+
+.chat-session-content :deep(.chat-turn.eager .cmark-node > *) {
+  content-visibility: visible;
 }
 
 .bottom-overlay {

@@ -157,7 +157,7 @@ func (s *server) writeOpenAIImages(w http.ResponseWriter, r *http.Request, reque
 			media, size, err = fitImage(media, target, format, compression)
 			if err != nil {
 				if !streamed(err) {
-					writeOpenAIFailure(w, http.StatusBadGateway, "upstream_error", err)
+					writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
 				}
 				return
 			}
@@ -537,12 +537,12 @@ func (s *server) handleOpenAISpeech(w http.ResponseWriter, r *http.Request) {
 	}
 	media, err := joinedAudio(result.media)
 	if err != nil {
-		writeOpenAIFailure(w, http.StatusBadGateway, "upstream_error", err)
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
 		return
 	}
 	data, contentType, err := encodeSpeechResponse(media, format)
 	if err != nil {
-		writeOpenAIFailure(w, http.StatusBadGateway, "upstream_error", err)
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", contentType)

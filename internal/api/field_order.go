@@ -1,10 +1,9 @@
 package api
 
 import (
+	"bytes"
 	_ "embed"
 	"encoding/json"
-	"encoding/json/jsontext"
-	jsonv2 "encoding/json/v2"
 	"maps"
 	"slices"
 	"strings"
@@ -143,23 +142,28 @@ func (order *fieldOrder) value(value any, parent string) any {
 	return value
 }
 
-// MarshalJSONTo 只排列当前动态对象的键，字段值由 encoding/json 编码
-func (o orderedJSON) MarshalJSONTo(encoder *jsontext.Encoder) error {
+// MarshalJSON 只排列当前动态对象的键，字段值由 encoding/json 编码
+func (o orderedJSON) MarshalJSON() ([]byte, error) {
 	keys := slices.Collect(maps.Keys(o.fields))
 	ranks := o.order.ranksFor(o.fields, o.parent)
 	slices.SortFunc(keys, func(a, b string) int { return o.order.compare(ranks, a, b) })
-	if err := encoder.WriteToken(jsontext.BeginObject); err != nil {
-		return err
-	}
-	for _, key := range keys {
-		if err := encoder.WriteToken(jsontext.String(key)); err != nil {
-			return err
+	var buffer bytes.Buffer
+	buffer.WriteByte('{')
+	for index, key := range keys {
+		if index > 0 {
+			buffer.WriteByte(',')
 		}
-		if err := jsonv2.MarshalEncode(encoder, o.fields[key]); err != nil {
-			return err
+		name, _ := json.Marshal(key)
+		item, err := json.Marshal(o.fields[key])
+		if err != nil {
+			return nil, err
 		}
+		buffer.Write(name)
+		buffer.WriteByte(':')
+		buffer.Write(item)
 	}
-	return encoder.WriteToken(jsontext.EndObject)
+	buffer.WriteByte('}')
+	return buffer.Bytes(), nil
 }
 
 // object 返回固定响应的具名结构体或动态字段对象
@@ -271,7 +275,6 @@ func (order *fieldOrder) object(fields map[string]any, parent string) any {
 		if mapString(fields, "object") == "interaction" {
 			return interactionJSON{
 				Created:               fields["created"],
-				EnvironmentID:         fields["environment_id"],
 				ID:                    fields["id"],
 				Model:                 fields["model"],
 				Object:                fields["object"],
@@ -408,11 +411,10 @@ type responsesJSON struct {
 
 // interactionJSON 是 Interactions 响应资源
 type interactionJSON struct {
-	Created       any `json:"created,omitempty"`
-	EnvironmentID any `json:"environment_id,omitempty"`
-	ID            any `json:"id,omitempty"`
-	Model         any `json:"model,omitempty"`
-	Object        any `json:"object,omitempty"`
+	Created any `json:"created,omitempty"`
+	ID      any `json:"id,omitempty"`
+	Model   any `json:"model,omitempty"`
+	Object  any `json:"object,omitempty"`
 	// PreviousInteractionID 是续接的前序交互
 	PreviousInteractionID any `json:"previous_interaction_id,omitempty"`
 	Status                any `json:"status,omitempty"`

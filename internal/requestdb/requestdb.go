@@ -32,9 +32,6 @@ const batchLimit = 256
 // queueLimit 是等待写入的最大记录数，队列已满时丢弃新记录
 const queueLimit = 4096
 
-// statementCache 是账本每个连接缓存的预编译语句数，容纳写入记录、正文、小时与日汇总的全部语句
-const statementCache = 16
-
 // hourMS 是一小时的毫秒数
 const hourMS = int64(time.Hour / time.Millisecond)
 
@@ -54,10 +51,8 @@ CREATE TABLE IF NOT EXISTS requests (
  duration_ms INTEGER NOT NULL, first_event_ms INTEGER NOT NULL, queue_ms INTEGER NOT NULL,
  input_tokens INTEGER NOT NULL, reasoning_tokens INTEGER NOT NULL, reply_tokens INTEGER NOT NULL,
  total_tokens INTEGER NOT NULL, tool_calls INTEGER NOT NULL, error TEXT NOT NULL, attempts TEXT NOT NULL,
- cached_tokens INTEGER NOT NULL DEFAULT 0, proof_ms INTEGER NOT NULL DEFAULT 0, proof_lock_ms INTEGER NOT NULL DEFAULT 0,
- proof_interaction_ms INTEGER NOT NULL DEFAULT 0, proof_refresh_ms INTEGER NOT NULL DEFAULT 0, proof_compute_ms INTEGER NOT NULL DEFAULT 0);
+ cached_tokens INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS requests_time ON requests(time);
-CREATE INDEX IF NOT EXISTS requests_cost ON requests(time, model, input_tokens, cached_tokens, reasoning_tokens, reply_tokens);
 CREATE INDEX IF NOT EXISTS requests_model_time ON requests(model, time);
 CREATE INDEX IF NOT EXISTS requests_account_time ON requests(account, time);
 CREATE INDEX IF NOT EXISTS requests_state_time ON requests(state, time);
@@ -81,7 +76,6 @@ type Row struct {
 	Duration        time.Duration
 	FirstEvent      time.Duration
 	Queue           time.Duration
-	Proof           api.ProofTiming
 	InputTokens     int64
 	CachedTokens    int64
 	ReasoningTokens int64
@@ -98,8 +92,8 @@ type write struct {
 	body *api.RequestBody
 }
 
-// Logger 输出账本写入失败与丢弃记录的运行日志，attrs 依次为字段的英文标识与取值
-type Logger func(level, message string, attrs ...any)
+// Logger 输出账本写入失败与丢弃记录的运行日志
+type Logger func(level string, message string)
 
 // Store 串行批量写入请求账本与汇总，并提供聚合与明细查询
 type Store struct {
@@ -118,7 +112,7 @@ func Open(path string, log Logger) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	db, err := sqlitedb.Open(path, schema, statementCache)
+	db, err := sqlitedb.Open(path, schema)
 	if err != nil {
 		return nil, fmt.Errorf("初始化请求账本: %w", err)
 	}
@@ -222,10 +216,10 @@ func (store *Store) run() {
 // commit 写入一批记录，记录写入失败与队列丢弃
 func (store *Store) commit(batch []write) {
 	if err := store.write(batch); err != nil {
-		store.log("ERROR", "请求账本写入失败", "records", len(batch), "error", err)
+		store.log("ERROR", fmt.Sprintf("请求账本写入失败 | 记录=%d | 错误=%v", len(batch), err))
 	}
 	if dropped := store.dropped.Swap(0); dropped > 0 {
-		store.log("WARN", "请求账本写入队列已满", "dropped", dropped)
+		store.log("WARN", fmt.Sprintf("请求账本写入队列已满 | 丢弃=%d", dropped))
 	}
 }
 
@@ -282,12 +276,11 @@ func (store *Store) write(batch []write) (err error) {
 			if err != nil {
 				return err
 			}
-			result, err := tx.Exec(`INSERT OR IGNORE INTO requests VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			result, err := tx.Exec(`INSERT OR IGNORE INTO requests VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 				row.ID, row.Time.UnixMilli(), row.Protocol, row.Path, row.Model, row.Account, row.Channel, row.Status, row.State,
 				row.Duration.Milliseconds(), row.FirstEvent.Milliseconds(), row.Queue.Milliseconds(),
 				row.InputTokens, row.ReasoningTokens, row.ReplyTokens, row.TotalTokens, row.ToolCalls, row.Error, string(encoded),
-				row.CachedTokens, row.Proof.Total.Milliseconds(), row.Proof.Lock.Milliseconds(), row.Proof.Interaction.Milliseconds(),
-				row.Proof.Refresh.Milliseconds(), row.Proof.Compute.Milliseconds())
+				row.CachedTokens)
 			if err != nil {
 				return err
 			}
@@ -375,7 +368,7 @@ func (store *Store) prune() {
 	_, daysErr := store.db.Exec(`DELETE FROM days WHERE start < ?`, day)
 	reclaimErr := sqlitedb.Reclaim(context.Background(), store.db)
 	if err := errors.Join(requestsErr, hoursErr, daysErr, reclaimErr); err != nil {
-		store.log("ERROR", "请求账本清理失败", "error", err)
+		store.log("ERROR", fmt.Sprintf("请求账本清理失败 | 错误=%v", err))
 	}
 }
 
@@ -432,7 +425,7 @@ func (store *Store) alignDays() (err error) {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	store.log("INFO", "请求账本已按服务器时区重建本地日汇总", "days", rebuilt)
+	store.log("INFO", fmt.Sprintf("请求账本已按服务器时区重建本地日汇总 | 天数=%d", rebuilt))
 	return nil
 }
 

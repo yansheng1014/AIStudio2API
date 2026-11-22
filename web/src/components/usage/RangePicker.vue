@@ -68,7 +68,7 @@ function applyCustom(): void {
 <template>
   <PopoverRoot :open="open" @update:open="prepare">
     <PopoverTrigger
-      class="flex min-w-0 items-center gap-2 rounded-md border border-line bg-canvas px-3 py-1 text-left text-sm text-gray-200 transition-colors hover:border-gray-600 data-[state=open]:border-blue-500"
+      class="flex min-w-0 items-center gap-2 rounded-md border border-line bg-canvas px-3 py-1.5 text-left text-sm text-gray-200 transition-colors hover:border-gray-600 data-[state=open]:border-blue-500"
       :aria-label="`${t('usage.range')}: ${t(`usage.range.${range}`)} ${summary}`"
     >
       <UiIcon name="calendar" :size="14" class="text-gray-400" />
@@ -85,7 +85,7 @@ function applyCustom(): void {
         align="start"
         :side-offset="6"
         :collision-padding="12"
-        class="ui-popover z-[60] max-h-(--reka-popover-content-available-height) w-[min(36rem,calc(100vw-24px))] overflow-y-auto rounded-lg border border-line bg-panel p-3 text-sm shadow-xl shadow-black/40"
+        class="ui-popover z-[60] w-[min(36rem,calc(100vw-24px))] rounded-lg border border-line bg-panel p-3 text-sm shadow-xl shadow-black/40"
       >
         <div class="grid gap-4 sm:grid-cols-[1fr_1.1fr]">
           <div class="space-y-3">

@@ -1,11 +1,11 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"slices"
-	"strconv"
 	"strings"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
@@ -133,10 +133,8 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	declaredSearch := generateRequest.Tools.GoogleSearch != nil || slices.Contains(generateRequest.Tools.Google, "google_search")
 	generateRequest = s.prepareSearch(generateRequest)
 	generateRequest.Unary = !request.Stream || s.responseModes().FakeStream
-	media := s.mediaOutputFor(r)
 	if !request.Stream {
 		var stopKeepalive func()
 		w, stopKeepalive = s.nonstreamKeepalive(w, r)
@@ -183,7 +181,7 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			send: sseSender(stream), id: messageID, model: request.Model,
 			inputTokens: <-estimate, startUsage: startUsage,
 			searchKey: s.config.APIKey, omitted: request.thinkingOmitted(),
-			media: media, context: contextResult, search: declaredSearch,
+			media: s.mediaOutputFor(r), context: contextResult, search: s.anthropicSearchable(r.Context(), generateRequest),
 		}
 		if err := writer.start(); err != nil {
 			return
@@ -198,6 +196,7 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		}
 		return
 	}
+	media := s.mediaOutputFor(r)
 	if err := media.saveEvents(result.events); err != nil {
 		writeAnthropicRequestError(w, err)
 		return
@@ -502,50 +501,18 @@ func anthropicRole(role string) (aistudio.Role, error) {
 	}
 }
 
-// anthropicPartBlock 是 anthropicParts 读取的消息块字段
-type anthropicPartBlock struct {
-	Type      string          `json:"type"`
-	Text      string          `json:"text"`
-	Data      string          `json:"data"`
-	ID        string          `json:"id"`
-	Name      string          `json:"name"`
-	Input     json.RawMessage `json:"input"`
-	ToolUseID string          `json:"tool_use_id"`
-	Content   json.RawMessage `json:"content"`
-	IsError   bool            `json:"is_error"`
-	Signature string          `json:"signature"`
-	Source    json.RawMessage `json:"source"`
-	Title     string          `json:"title"`
-	Context   string          `json:"context"`
-	FileID    string          `json:"file_id"`
-}
-
-// anthropicParts 转换消息块并保留工具调用的思考签名；块解码失败时先转换其前的块，再返回该块的解码错误
+// anthropicParts 转换消息块并保留工具调用的思考签名
 func anthropicParts(raw json.RawMessage) ([]aistudio.Part, error) {
 	var text string
-	if len(raw) == 0 || raw[0] != '[' {
-		if err := json.Unmarshal(raw, &text); err == nil {
-			if text == "" {
-				return nil, nil
-			}
-			return []aistudio.Part{{Text: text}}, nil
+	if err := json.Unmarshal(raw, &text); err == nil {
+		if text == "" {
+			return nil, nil
 		}
+		return []aistudio.Part{{Text: text}}, nil
 	}
-	var blocks []anthropicPartBlock
-	decodeErr := json.Unmarshal(raw, &blocks)
-	if decodeErr != nil {
-		var rawBlocks []json.RawMessage
-		if err := json.Unmarshal(raw, &rawBlocks); err != nil {
-			return nil, fmt.Errorf("content must be a string or block array")
-		}
-		blocks = make([]anthropicPartBlock, 0, len(rawBlocks))
-		for _, rawBlock := range rawBlocks {
-			var block anthropicPartBlock
-			if decodeErr = json.Unmarshal(rawBlock, &block); decodeErr != nil {
-				break
-			}
-			blocks = append(blocks, block)
-		}
+	var blocks []json.RawMessage
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return nil, fmt.Errorf("content must be a string or block array")
 	}
 	parts := make([]aistudio.Part, 0, len(blocks))
 	pendingSignature := ""
@@ -556,7 +523,26 @@ func anthropicParts(raw json.RawMessage) ([]aistudio.Part, error) {
 		parts = append(parts, aistudio.Part{ThoughtSignature: pendingSignature})
 		pendingSignature = ""
 	}
-	for _, block := range blocks {
+	for _, rawBlock := range blocks {
+		var block struct {
+			Type      string          `json:"type"`
+			Text      string          `json:"text"`
+			Data      string          `json:"data"`
+			ID        string          `json:"id"`
+			Name      string          `json:"name"`
+			Input     json.RawMessage `json:"input"`
+			ToolUseID string          `json:"tool_use_id"`
+			Content   json.RawMessage `json:"content"`
+			IsError   bool            `json:"is_error"`
+			Signature string          `json:"signature"`
+			Source    json.RawMessage `json:"source"`
+			Title     string          `json:"title"`
+			Context   string          `json:"context"`
+			FileID    string          `json:"file_id"`
+		}
+		if err := json.Unmarshal(rawBlock, &block); err != nil {
+			return nil, err
+		}
 		switch block.Type {
 		case "text":
 			if block.Text == "" {
@@ -599,7 +585,7 @@ func anthropicParts(raw json.RawMessage) ([]aistudio.Part, error) {
 					return nil, fmt.Errorf("%s source data: %w", block.Type, err)
 				}
 				mediaType, data := normalizeImagePayload(attachmentMIME(source.MediaType, block.Title, data), data)
-				parts = append(parts, aistudio.Part{InlineData: aistudio.NewBlob(mediaType, data), DisplayName: block.Title})
+				parts = append(parts, aistudio.Part{InlineData: &aistudio.Blob{MIME: mediaType, Data: data}, DisplayName: block.Title})
 			case "url":
 				if media, ok := aistudio.ExternalMediaForURL(source.URL); ok {
 					parts = append(parts, aistudio.Part{ExternalMedia: media, DisplayName: block.Title})
@@ -721,27 +707,12 @@ func anthropicParts(raw json.RawMessage) ([]aistudio.Part, error) {
 			return nil, fmt.Errorf("unsupported content block type %q", block.Type)
 		}
 	}
-	if decodeErr != nil {
-		return nil, decodeErr
-	}
 	flushPendingSignature()
 	return parts, nil
 }
 
 func mapAnthropicTools(tools []anthropicTool, choice json.RawMessage) (aistudio.Tools, error) {
-	config, err := anthropicToolChoice(choice)
-	if err != nil {
-		return aistudio.Tools{}, err
-	}
 	var mapped aistudio.Tools
-	// chosen 是 tool_choice 指定的 server tool 对应的 Google 工具
-	chosen := ""
-	server := func(tool anthropicTool, google string) {
-		mapped.Google = appendUnique(mapped.Google, google)
-		if len(config.AllowedFunctionNames) == 1 && config.AllowedFunctionNames[0] == tool.Name {
-			chosen = google
-		}
-	}
 	for _, tool := range tools {
 		typeName := strings.ToLower(tool.Type)
 		switch {
@@ -760,12 +731,12 @@ func mapAnthropicTools(tools []anthropicTool, choice json.RawMessage) (aistudio.
 				return aistudio.Tools{}, fmt.Errorf("web_search blocked_domains: %w", err)
 			}
 			mapped.GoogleSearch = search
-			server(tool, "google_search")
+			mapped.Google = appendUnique(mapped.Google, "google_search")
 		case typeName == "image_search":
 			if err := validateAnthropicServerTool(tool, "image_search"); err != nil {
 				return aistudio.Tools{}, err
 			}
-			server(tool, "image_search")
+			mapped.Google = appendUnique(mapped.Google, "image_search")
 		case strings.HasPrefix(typeName, "web_fetch_"):
 			if err := validateAnthropicServerTool(tool, "web_fetch"); err != nil {
 				return aistudio.Tools{}, err
@@ -781,12 +752,12 @@ func mapAnthropicTools(tools []anthropicTool, choice json.RawMessage) (aistudio.
 			if len(fetch.AllowedDomains) > 0 || len(fetch.BlockedDomains) > 0 {
 				mapped.URLContext = &fetch
 			}
-			server(tool, "url_context")
+			mapped.Google = appendUnique(mapped.Google, "url_context")
 		case strings.HasPrefix(typeName, "code_execution_"):
 			if err := validateAnthropicServerTool(tool, "code_execution"); err != nil {
 				return aistudio.Tools{}, err
 			}
-			server(tool, "code_execution")
+			mapped.Google = appendUnique(mapped.Google, "code_execution")
 		case strings.HasPrefix(typeName, "tool_search_tool_"), strings.HasPrefix(typeName, "advisor_"), strings.Contains(typeName, "toolset"):
 		case strings.HasPrefix(typeName, "bash_"), strings.HasPrefix(typeName, "text_editor_"), strings.HasPrefix(typeName, "memory_"), strings.HasPrefix(typeName, "computer_"):
 			declaration, err := anthropicClientTool(tool, typeName)
@@ -798,12 +769,12 @@ func mapAnthropicTools(tools []anthropicTool, choice json.RawMessage) (aistudio.
 			if err := validateAnthropicServerTool(tool, "url_context"); err != nil {
 				return aistudio.Tools{}, err
 			}
-			server(tool, "url_context")
+			mapped.Google = appendUnique(mapped.Google, "url_context")
 		case typeName == "google_maps":
 			if err := validateAnthropicServerTool(tool, "google_maps"); err != nil {
 				return aistudio.Tools{}, err
 			}
-			server(tool, "google_maps")
+			mapped.Google = appendUnique(mapped.Google, "google_maps")
 		case typeName == "", typeName == "custom":
 			if tool.Name == "" {
 				return aistudio.Tools{}, fmt.Errorf("tool name is required")
@@ -825,14 +796,9 @@ func mapAnthropicTools(tools []anthropicTool, choice json.RawMessage) (aistudio.
 			return aistudio.Tools{}, fmt.Errorf("unsupported tool type %q", tool.Type)
 		}
 	}
-	if chosen != "" {
-		config.AllowedFunctionNames, mapped.Functions, mapped.Google = nil, nil, []string{chosen}
-		if chosen != "google_search" {
-			mapped.GoogleSearch = nil
-		}
-		if chosen != "url_context" {
-			mapped.URLContext = nil
-		}
+	config, err := anthropicToolChoice(choice)
+	if err != nil {
+		return aistudio.Tools{}, err
 	}
 	mapped.ToolConfig = config
 	return mapped, nil
@@ -1085,25 +1051,8 @@ func anthropicBlocks(result generationResult, omitted bool, media mediaOutput, s
 // sseSender 返回把流式事件写成 SSE 的发送函数
 func sseSender(w http.ResponseWriter) func(string, any) error {
 	return func(eventType string, payload any) error {
-		if frame, ok := anthropicTextDelta(eventType, payload); ok {
-			return writeSSEFrame(w, frame)
-		}
 		return writeSSE(w, eventType, officialOrder("anthropic", payload))
 	}
-}
-
-// anthropicTextDelta 返回正文 text_delta 的 content_block_delta SSE 帧，字节与按官方字段顺序编码的同一事件相同；其他事件返回 false
-func anthropicTextDelta(eventType string, payload any) ([]byte, bool) {
-	event, _ := payload.(map[string]any)
-	delta, _ := event["delta"].(map[string]any)
-	index, indexed := event["index"].(int)
-	text, texted := delta["text"].(string)
-	if eventType != "content_block_delta" || len(event) != 3 || len(delta) != 2 || delta["type"] != "text_delta" || !indexed || !texted {
-		return nil, false
-	}
-	frame := strconv.AppendInt(append(sseFrameStart(eventType, 96+len(text)), `{"type":"content_block_delta","index":`...), int64(index), 10)
-	frame = appendJSONString(append(frame, `,"delta":{"type":"text_delta","text":`...), text)
-	return append(frame, "}}\n\n"...), true
 }
 
 // anthropicBlockCollector 把流式内容块事件累积为非流式 Message 的内容块
@@ -1229,7 +1178,7 @@ func anthropicCapabilities(model aistudio.Model) map[string]any {
 			"low":       support(slices.Contains(model.ThinkingLevels, "LOW")),
 			"medium":    support(slices.Contains(model.ThinkingLevels, "MEDIUM")),
 			"high":      support(slices.Contains(model.ThinkingLevels, "HIGH")),
-			"xhigh":     support(slices.Contains(model.ThinkingLevels, "EXTRA_HIGH")),
+			"xhigh":     support(false),
 			"max":       support(false),
 		},
 		"image_input":        support(chat),
@@ -1265,7 +1214,7 @@ type anthropicStreamWriter struct {
 	media             mediaOutput
 	codeIDs           codeExecutionIDs
 	context           anthropicContextResult
-	// search 为 true 时思考之后的事件推迟到搜索块之后写出，流式请求只在客户端声明 web_search 工具时为 true，全局搜索与搜索型号的正文实时写出、搜索块写在其后
+	// search 为 true 时思考之后的事件推迟到搜索块之后写出
 	search bool
 	// deferred 是等待搜索块写出的事件
 	deferred []aistudio.Event
@@ -1275,6 +1224,20 @@ type anthropicStreamWriter struct {
 	citations []anthropicCitationGroup
 	cited     *anthropicCitationGroup
 	source    int
+}
+
+// anthropicSearchable 判断本次生成能否发起网页搜索：请求启用了 Google 搜索或模型走 Build 写代码助手
+func (s *server) anthropicSearchable(ctx context.Context, request aistudio.GenerateRequest) bool {
+	if request.Tools.GoogleSearch != nil || slices.Contains(request.Tools.Google, "google_search") {
+		return true
+	}
+	name, _, err := aistudio.ApplyModelSuffix(request.Model, aistudio.GenerationConfig{})
+	if err != nil {
+		return false
+	}
+	models, _ := s.service.Models(ctx)
+	model, _ := LookupPublicModel(models, name)
+	return model.Capabilities["assistant_route"]
 }
 
 // streamAnthropic 写出流式事件
@@ -1351,13 +1314,13 @@ func (writer *anthropicStreamWriter) live(event aistudio.Event) error {
 		if writer.currentBlock == "text" || writer.currentBlock == anthropicCitedBlock {
 			return nil
 		}
-		return writer.signatureThinking(event.ThoughtSignature)
+		return writer.redactedThinking(event.ThoughtSignature)
 	case aistudio.EventToolCall:
 		call := event.FunctionCall
 		if call.ThoughtSignature != "" {
 			if writer.currentBlock == "thinking" {
 				writer.thinkingSignature = call.ThoughtSignature
-			} else if err := writer.signatureThinking(call.ThoughtSignature); err != nil {
+			} else if err := writer.redactedThinking(call.ThoughtSignature); err != nil {
 				return err
 			}
 		}
@@ -1421,7 +1384,7 @@ func (writer *anthropicStreamWriter) live(event aistudio.Event) error {
 		if event.ThoughtSignature != "" {
 			if writer.currentBlock == "thinking" {
 				writer.thinkingSignature = event.ThoughtSignature
-			} else if err := writer.signatureThinking(event.ThoughtSignature); err != nil {
+			} else if err := writer.redactedThinking(event.ThoughtSignature); err != nil {
 				return err
 			}
 		}
@@ -1558,16 +1521,23 @@ func (writer *anthropicStreamWriter) ensureBlock(blockType string) error {
 	return nil
 }
 
-// signatureThinking 把没有思考正文的思考签名输出为正文为空的 thinking 块，与官方不显示思考时的输出同形
-func (writer *anthropicStreamWriter) signatureThinking(signature string) error {
+func (writer *anthropicStreamWriter) redactedThinking(data string) error {
 	if err := writer.closeBlock(); err != nil {
 		return err
 	}
-	if err := writer.ensureBlock("thinking"); err != nil {
+	if err := writer.send("content_block_start", map[string]any{
+		"type": "content_block_start", "index": writer.blockIndex,
+		"content_block": map[string]any{"type": "redacted_thinking", "data": data},
+	}); err != nil {
 		return err
 	}
-	writer.thinkingSignature = signature
-	return writer.closeBlock()
+	if err := writer.send("content_block_stop", map[string]any{
+		"type": "content_block_stop", "index": writer.blockIndex,
+	}); err != nil {
+		return err
+	}
+	writer.blockIndex++
+	return nil
 }
 
 func (writer *anthropicStreamWriter) closeBlock() error {
@@ -1700,6 +1670,6 @@ func (writer *anthropicStreamWriter) finish(result generationResult) error {
 func (writer *anthropicStreamWriter) error(err error) error {
 	return writer.send("error", map[string]any{
 		"type":  "error",
-		"error": map[string]string{"type": anthropicErrorType(err), "message": retryMessage(publicErrorMessage(statusFromError(err), anthropicErrorMessage(err)), retryAfterSeconds(err))},
+		"error": map[string]string{"type": anthropicErrorType(err), "message": publicErrorMessage(statusFromError(err), anthropicErrorMessage(err))},
 	})
 }

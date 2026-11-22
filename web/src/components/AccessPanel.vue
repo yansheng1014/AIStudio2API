@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, reactive, ref, watch } from 'vue'
 import { capabilities, chatModel } from '@/access/capabilities'
-import { clients, protocolNames, type Client, type Protocol, type Shell } from '@/access/clients'
+import { clients, type CherryType, type Client, type Shell } from '@/access/clients'
 import {
   bodyFields,
   endpointAuth,
@@ -15,9 +15,7 @@ import {
 import { maskKey, splitKeys } from '@/apikey'
 import { useI18n, type TranslationKey } from '@/i18n'
 import type { IconName } from '@/icons'
-import { formatLogNumber } from '@/logs'
 import { defaultChatModel } from '@/playground/catalog'
-import { useRunningClock } from '@/playground/clock'
 import { errorMessage } from '@/playground/request'
 import type { Model, ServiceConfig } from '@/types'
 import { useQueryParam } from '@/url'
@@ -32,7 +30,7 @@ import UiSelect from './UiSelect.vue'
 defineOptions({ name: 'AccessPanel' })
 const props = defineProps<{ config: ServiceConfig | null; models: Model[] }>()
 const emit = defineEmits<{ settings: [] }>()
-const { t, locale } = useI18n()
+const { t } = useI18n()
 
 // origin 是浏览器访问本服务所用的地址，客户端与示例代码以它为服务地址
 const origin = window.location.origin
@@ -81,9 +79,9 @@ const keyShown = ref(false)
 watch(keys, (list) => {
   if (keyIndex.value >= list.length) keyIndex.value = 0
 })
-// rowClass 是地址、密钥与客户端字段列表一行的布局：内容列窄时字段名单独一行，宽时三列
+// rowClass 是地址、密钥与客户端字段列表一行的布局：窄屏字段名单独一行，宽屏三列
 const rowClass =
-  'grid min-h-12 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 py-1.5 @lg:grid-cols-[10rem_minmax(0,1fr)_auto]'
+  'grid min-h-12 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-3 py-1.5 pr-1.5 pl-3 sm:grid-cols-[10rem_minmax(0,1fr)_auto]'
 
 // revealClass 是显示与隐藏密钥按钮的样式
 const revealClass =
@@ -131,13 +129,11 @@ function keepModel(selected: string, list: readonly Model[]): string {
   return (defaultChatModel(list) ?? list[0])?.id ?? ''
 }
 
-// TestResult 是连通测试中一个请求的结果：请求、是否成功、说明、发出时刻与耗时毫秒数
-// 约束：请求进行中时 ok 为 undefined、elapsed 为 0
+// TestResult 是连通测试中一个请求的结果：请求、是否成功、说明与耗时
 interface TestResult {
   request: string
-  ok?: boolean
+  ok: boolean
   detail: string
-  started: number
   elapsed: number
 }
 const testModel = ref('')
@@ -146,40 +142,36 @@ watch(chatModels, (list) => (testModel.value = keepModel(testModel.value, list))
 })
 const testing = ref(false)
 const results = ref<TestResult[]>([])
-// now 是测试进行中按时钟更新的 performance.now()
-const now = useRunningClock(() => testing.value)
 
-// runningText 返回进行中的请求已用的秒数
-function runningText(item: TestResult): string {
-  const seconds = Math.max(0, Math.floor((now.value - item.started) / 1000))
-  return formatLogNumber(seconds, locale.value, 0, 'second')
-}
-
-// probe 先放入一行进行中的请求，发送后原地换成结果，read 读取成功响应的说明；连接失败或返回错误时记录原因并返回 false
+// probe 发送一个测试请求并记录结果，read 读取成功响应的说明；连接失败或返回错误时记录原因并返回 false
 async function probe(
   request: string,
   init: RequestInit & { path: string },
   read: (body: unknown) => string,
 ): Promise<boolean> {
   const started = performance.now()
-  const index =
-    results.value.push({ request, detail: t('access.testWaiting'), started, elapsed: 0 }) - 1
-  const finish = (ok: boolean, detail: string) => {
-    results.value[index] = {
-      request,
-      ok,
-      detail,
-      started,
-      elapsed: Math.round(performance.now() - started),
-    }
-    return ok
-  }
   try {
     const response = await fetch(init.path, init)
-    if (!response.ok) return finish(false, `${response.status} ${await errorMessage(response)}`)
-    return finish(true, read(await response.json()))
+    const elapsed = Math.round(performance.now() - started)
+    if (!response.ok) {
+      results.value.push({
+        request,
+        ok: false,
+        detail: `${response.status} ${await errorMessage(response)}`,
+        elapsed,
+      })
+      return false
+    }
+    results.value.push({ request, ok: true, detail: read(await response.json()), elapsed })
+    return true
   } catch (error) {
-    return finish(false, error instanceof TypeError ? t('access.testUnreachable') : String(error))
+    results.value.push({
+      request,
+      ok: false,
+      detail: error instanceof TypeError ? t('access.testUnreachable') : String(error),
+      elapsed: Math.round(performance.now() - started),
+    })
+    return false
   }
 }
 
@@ -227,7 +219,7 @@ const clientID = useQueryParam(
   clients[0]!.id,
 )
 const client = computed(() => clients.find((item) => item.id === clientID.value)!)
-// clientGroups 是客户端选择列表的各组
+// clientGroups 是客户端选择网格的各组
 const clientGroups = computed(() =>
   groups.map((group) => ({
     label: t(group.label),
@@ -247,15 +239,13 @@ watch(
   },
   { immediate: true },
 )
-// selectedProtocols 是各客户端已选的接入协议
-const selectedProtocols = reactive<Record<string, Protocol>>({})
-// clientProtocol 是当前客户端的接入协议，未选择时为该客户端的第一个协议
-const clientProtocol = computed<Protocol>({
-  get: () => selectedProtocols[client.value.id] ?? client.value.protocols[0]!,
-  set: (value) => {
-    selectedProtocols[client.value.id] = value
-  },
-})
+const cherry = ref<CherryType>('openai')
+// cherryTypes 是 Cherry Studio 的接口类型选项
+const cherryTypes: { value: CherryType; label: string }[] = [
+  { value: 'openai', label: 'OpenAI' },
+  { value: 'gemini', label: 'Gemini' },
+  { value: 'anthropic', label: 'Anthropic' },
+]
 // tierLabels 是 Claude Code 三档模型的选择框名称
 const tierLabels: { tier: keyof typeof tiers; label: TranslationKey }[] = [
   { tier: 'opus', label: 'access.tierOpus' },
@@ -276,7 +266,7 @@ const clientInput = computed(() => ({
   models: chatModels.value,
   catalog: props.models,
   shell: shell.value,
-  protocol: clientProtocol.value,
+  cherry: cherry.value,
   t,
 }))
 const steps = computed(() => client.value.steps(clientInput.value))
@@ -401,21 +391,26 @@ function methodClass(method: string): string {
 
 <template>
   <section class="flex min-h-0 flex-1 flex-col">
-    <header class="page-x overflow-hidden border-b border-line py-4 [scrollbar-gutter:stable]">
+    <header
+      class="border-b border-line px-4 py-4 md:px-[max(2rem,calc((100%_-_var(--container-4xl)_-_14rem)/2_+_2rem))]"
+    >
       <h2 class="text-xl font-semibold text-white">{{ t('section.access.title') }}</h2>
+      <p class="mt-1 text-sm text-gray-500">{{ t('section.access.description') }}</p>
     </header>
 
-    <div class="min-h-0 flex-1 overflow-auto [scrollbar-gutter:stable]">
-      <div class="page-x flex flex-col @max-3xl:px-0 @3xl:flex-row">
+    <div class="min-h-0 flex-1 overflow-auto [scrollbar-gutter:stable_both-edges]">
+      <div
+        class="mx-auto flex w-full max-w-[calc(var(--container-4xl)_+_14rem)] flex-col md:flex-row"
+      >
         <nav
-          class="sticky top-0 z-10 flex shrink-0 gap-1 overflow-x-auto border-b border-line bg-canvas px-4 py-2 @3xl:w-56 @3xl:flex-col @3xl:self-start @3xl:border-b-0 @3xl:px-0 @3xl:py-8"
+          class="sticky top-0 z-10 flex shrink-0 gap-1 overflow-x-auto border-b border-line bg-canvas p-2 md:w-56 md:flex-col md:self-start md:border-b-0 md:p-4 md:pl-5"
           :aria-label="t('section.access.title')"
         >
           <button
             v-for="item in sections"
             :key="item.id"
             type="button"
-            class="flex shrink-0 items-center gap-2 rounded-md px-3 py-2 text-left text-sm whitespace-nowrap transition-colors @3xl:whitespace-normal"
+            class="flex shrink-0 items-center gap-2 rounded-md px-3 py-2 text-left text-sm whitespace-nowrap transition-colors md:whitespace-normal"
             :class="
               section === item.id
                 ? 'bg-raised text-white'
@@ -429,17 +424,17 @@ function methodClass(method: string): string {
           </button>
         </nav>
 
-        <div class="@container min-w-0 flex-1 px-4 pt-4 pb-16 @3xl:pt-8 @3xl:pr-0 @3xl:pl-8">
+        <div class="min-w-0 flex-1 px-4 pt-4 pb-16 md:px-8 md:pt-6">
           <h3 class="text-base font-semibold text-white">{{ t(current.label) }}</h3>
           <p class="mt-1 mb-5 text-sm text-gray-500">{{ t(current.description) }}</p>
 
           <template v-if="section === 'start'">
-            <article>
+            <article class="rounded-lg border border-line bg-panel p-4">
               <h4 class="text-sm font-semibold text-gray-200">{{ t('access.baseUrls') }}</h4>
               <p class="mt-1 text-xs text-gray-500">{{ t('access.baseUrlsHelp') }}</p>
-              <ul class="mt-3 divide-y divide-line/60 border-y border-line/60">
+              <ul class="mt-3 divide-y divide-line/60 rounded-md border border-line">
                 <li v-for="item in baseUrls" :key="item.name" :class="rowClass">
-                  <div class="col-span-2 @lg:col-span-1">
+                  <div class="col-span-2 sm:col-span-1">
                     <div class="text-sm text-gray-200">{{ item.name }}</div>
                     <div class="text-xs text-gray-500">{{ item.hint }}</div>
                   </div>
@@ -450,7 +445,7 @@ function methodClass(method: string): string {
                   />
                 </li>
                 <li v-if="config !== null && keys.length > 0" :class="rowClass">
-                  <div class="col-span-2 text-sm text-gray-200 @lg:col-span-1">
+                  <div class="col-span-2 text-sm text-gray-200 sm:col-span-1">
                     {{ t('settings.apiKey') }}
                   </div>
                   <div class="flex min-w-0 items-center gap-2">
@@ -485,12 +480,11 @@ function methodClass(method: string): string {
                 </li>
               </ul>
               <p class="mt-2 text-xs text-gray-500">{{ t('access.keyHelp') }}</p>
-              <div v-if="config !== null && keys.length === 0" class="mt-3 text-sm text-amber-200">
-                <p class="flex items-start gap-2">
-                  <UiIcon name="warning" :size="15" class="mt-0.5 shrink-0" />{{
-                    t('access.keyNone')
-                  }}
-                </p>
+              <div
+                v-if="config !== null && keys.length === 0"
+                class="mt-3 rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-200"
+              >
+                <p>{{ t('access.keyNone') }}</p>
                 <button
                   type="button"
                   class="mt-2 text-sm font-medium text-blue-400 hover:text-blue-300"
@@ -501,7 +495,7 @@ function methodClass(method: string): string {
               </div>
             </article>
 
-            <article class="mt-8">
+            <article class="mt-4 rounded-lg border border-line bg-panel p-4">
               <div class="flex flex-wrap items-center gap-3">
                 <div class="min-w-60 flex-1">
                   <h4 class="text-sm font-semibold text-gray-200">{{ t('access.env') }}</h4>
@@ -538,7 +532,7 @@ function methodClass(method: string): string {
               />
             </article>
 
-            <article class="mt-8">
+            <article class="mt-4 rounded-lg border border-line bg-panel p-4">
               <h4 class="text-sm font-semibold text-gray-200">{{ t('access.test') }}</h4>
               <p class="mt-1 text-xs text-gray-500">{{ t('access.testHelp') }}</p>
               <div class="mt-3 flex flex-wrap items-center gap-2">
@@ -563,39 +557,33 @@ function methodClass(method: string): string {
                   {{ t('access.testRun') }}
                 </button>
               </div>
-              <ul
-                v-if="results.length > 0"
-                class="mt-3 divide-y divide-line/60 border-y border-line/60"
-                aria-live="polite"
-              >
+              <ul v-if="results.length > 0" class="mt-3 space-y-1.5" aria-live="polite">
                 <li
                   v-for="item in results"
                   :key="item.request"
-                  class="flex items-start gap-2 py-2 text-sm"
+                  class="flex items-start gap-2 rounded-md border px-3 py-2 text-sm"
+                  :class="
+                    item.ok
+                      ? 'border-green-500/30 bg-green-500/5'
+                      : 'border-red-500/40 bg-red-500/10'
+                  "
                 >
                   <UiIcon
-                    :name="item.ok === undefined ? 'spinner' : item.ok ? 'success' : 'warning'"
+                    :name="item.ok ? 'success' : 'warning'"
                     :size="15"
                     class="mt-0.5"
-                    :class="item.ok === false ? 'text-red-400' : 'text-gray-400'"
+                    :class="item.ok ? 'text-green-400' : 'text-red-400'"
                   />
                   <code class="shrink-0 font-mono text-xs leading-5 text-gray-400">{{
                     item.request
                   }}</code>
                   <span
                     class="min-w-0 flex-1 break-words"
-                    :class="
-                      item.ok === undefined
-                        ? 'text-gray-400'
-                        : item.ok
-                          ? 'text-gray-200'
-                          : 'text-red-300'
-                    "
+                    :class="item.ok ? 'text-gray-200' : 'text-red-300'"
                     >{{ item.detail }}</span
                   >
-                  <span
-                    class="min-w-16 shrink-0 text-right font-mono text-xs leading-5 text-gray-500 tabular-nums"
-                    >{{ item.ok === undefined ? runningText(item) : `${item.elapsed} ms` }}</span
+                  <span class="shrink-0 font-mono text-xs leading-5 text-gray-500 tabular-nums"
+                    >{{ item.elapsed }} ms</span
                   >
                 </li>
               </ul>
@@ -603,44 +591,10 @@ function methodClass(method: string): string {
           </template>
 
           <template v-else-if="section === 'clients'">
-            <div class="grid gap-x-3 gap-y-1.5 @lg:grid-cols-[max-content_minmax(0,1fr)]">
-              <div
-                v-for="group in clientGroups"
-                :key="group.label"
-                class="grid gap-y-1 @lg:col-span-2 @lg:grid-cols-subgrid"
-                role="group"
-                :aria-label="group.label"
-              >
-                <div class="text-xs leading-8 whitespace-nowrap text-gray-500">
-                  {{ group.label }}
-                </div>
-                <div class="flex flex-wrap gap-1">
-                  <button
-                    v-for="item in group.items"
-                    :key="item.id"
-                    type="button"
-                    class="flex h-8 items-center gap-1.5 rounded-md px-2.5 text-[13px] whitespace-nowrap transition-colors"
-                    :class="
-                      clientID === item.id
-                        ? 'bg-raised text-white'
-                        : 'text-gray-400 hover:bg-raised/60 hover:text-gray-200'
-                    "
-                    :aria-pressed="clientID === item.id"
-                    @click="clientID = item.id"
-                  >
-                    <span
-                      class="choice-svg flex h-4 w-4 shrink-0 items-center justify-center text-base"
-                      aria-hidden="true"
-                      v-html="item.svg"
-                    ></span>
-                    {{ item.label }}
-                  </button>
-                </div>
-              </div>
-            </div>
+            <ChoiceGrid :groups="clientGroups" :selected="clientID" @select="clientID = $event" />
 
-            <article class="mt-5 border-t border-line">
-              <div class="flex flex-wrap items-start gap-3 border-b border-line/60 py-4">
+            <article class="mt-5 rounded-lg border border-line bg-panel">
+              <div class="flex flex-wrap items-start gap-3 border-b border-line p-4">
                 <div class="min-w-0 flex-1">
                   <div class="flex flex-wrap items-center gap-2">
                     <span
@@ -649,9 +603,10 @@ function methodClass(method: string): string {
                       v-html="client.icon"
                     ></span>
                     <h4 class="text-base font-semibold text-white">{{ client.name }}</h4>
-                    <span class="text-xs text-gray-500">{{
-                      client.protocols.map((item) => protocolNames[item]).join(' · ')
-                    }}</span>
+                    <span
+                      class="rounded border border-line px-1.5 py-0.5 font-mono text-xs text-gray-400"
+                      >{{ client.protocol }}</span
+                    >
                   </div>
                   <p class="mt-1 text-sm text-gray-400">{{ t(client.summary) }}</p>
                 </div>
@@ -666,7 +621,7 @@ function methodClass(method: string): string {
                 </a>
               </div>
 
-              <div class="flex flex-wrap items-end gap-3 border-b border-line/60 py-4">
+              <div class="flex flex-wrap items-end gap-3 border-b border-line p-4">
                 <label v-if="!client.noModel" class="flex min-w-0 flex-col gap-1">
                   <span class="text-xs text-gray-500">{{ t('access.model') }}</span>
                   <UiSelect
@@ -699,18 +654,15 @@ function methodClass(method: string): string {
                     </UiSelect>
                   </label>
                 </template>
-                <label
-                  v-if="client.protocols.length > 1 && !client.importsAll"
-                  class="flex min-w-0 flex-col gap-1"
-                >
-                  <span class="text-xs text-gray-500">{{ t('access.protocol') }}</span>
+                <label v-if="client.cherry" class="flex min-w-0 flex-col gap-1">
+                  <span class="text-xs text-gray-500">{{ t('access.field.cherryType') }}</span>
                   <UiSelect
-                    v-model="clientProtocol"
-                    class="w-64 max-w-full rounded border border-line bg-canvas px-3 py-2 text-sm text-gray-300"
-                    :aria-label="t('access.protocol')"
+                    v-model="cherry"
+                    class="w-40 rounded border border-line bg-canvas px-3 py-2 text-sm text-gray-300"
+                    :aria-label="t('access.field.cherryType')"
                   >
-                    <option v-for="item in client.protocols" :key="item" :value="item">
-                      {{ protocolNames[item] }}
+                    <option v-for="item in cherryTypes" :key="item.value" :value="item.value">
+                      {{ item.label }}
                     </option>
                   </UiSelect>
                 </label>
@@ -748,7 +700,7 @@ function methodClass(method: string): string {
                 </button>
               </div>
 
-              <div class="space-y-5 py-4">
+              <div class="space-y-5 p-4">
                 <div v-if="links.length > 0" class="flex flex-wrap items-center gap-3">
                   <a
                     v-for="link in links"
@@ -761,14 +713,18 @@ function methodClass(method: string): string {
                   </a>
                   <span class="text-xs text-gray-500">{{ t('access.importHelp') }}</span>
                 </div>
-                <p v-if="client.docker && loopback" class="text-xs text-gray-500">
+                <p
+                  v-if="client.docker && loopback"
+                  class="rounded-md border border-line bg-canvas p-3 text-xs text-gray-400"
+                >
                   {{ t('access.dockerNote').replace('{name}', client.name) }}
                 </p>
                 <ol class="space-y-5">
                   <li v-for="(step, index) in steps" :key="index" class="flex gap-3">
-                    <span class="w-4 shrink-0 text-right text-sm text-gray-500 tabular-nums">{{
-                      index + 1
-                    }}</span>
+                    <span
+                      class="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-raised text-xs font-medium text-gray-300 tabular-nums"
+                      >{{ index + 1 }}</span
+                    >
                     <div class="min-w-0 flex-1">
                       <p class="mb-2 text-sm text-gray-300">
                         {{ t(step.text).replace('{name}', client.name) }}
@@ -783,14 +739,14 @@ function methodClass(method: string): string {
                           t(shell === 'windows' ? 'access.shellWindows' : 'access.shellUnix')
                         "
                       />
-                      <dl v-else class="divide-y divide-line/60 border-y border-line/60">
+                      <dl v-else class="divide-y divide-line/60 rounded-md border border-line">
                         <div v-for="field in step.fields" :key="field.label" :class="rowClass">
-                          <dt class="col-span-2 text-xs text-gray-500 @lg:col-span-1">
+                          <dt class="col-span-2 text-xs text-gray-500 sm:col-span-1">
                             {{ field.label }}
                           </dt>
                           <dd
                             v-if="field.choice"
-                            class="col-span-2 min-h-7 py-1 text-sm text-gray-200 @lg:col-span-2"
+                            class="col-span-2 min-h-7 py-1 text-sm text-gray-200 sm:col-span-2"
                           >
                             {{ field.value }}
                           </dd>
@@ -826,14 +782,6 @@ function methodClass(method: string): string {
               <div class="border-b border-line p-4">
                 <h4 class="text-base font-semibold text-white">{{ t(capability.label) }}</h4>
                 <p class="mt-1 text-sm text-gray-400">{{ t(capability.description) }}</p>
-                <p
-                  v-if="capability.notice"
-                  class="mt-2 flex items-start gap-2 text-sm text-amber-200"
-                >
-                  <UiIcon name="warning" :size="15" class="mt-0.5 shrink-0" />{{
-                    t(capability.notice)
-                  }}
-                </p>
                 <ul class="mt-3 flex flex-wrap gap-1.5">
                   <li v-for="[method, path] in capability.endpoints" :key="method + path">
                     <button
@@ -938,15 +886,13 @@ function methodClass(method: string): string {
                     :key="endpoint.method + endpoint.path"
                     class="scroll-mt-16"
                   >
-                    <div
-                      class="flex cursor-pointer items-center gap-1 py-1 pr-1.5 pl-2"
-                      @click="toggleEndpoint(endpointKey(endpoint.method, endpoint.path))"
-                    >
+                    <div class="flex items-center gap-1 py-1 pr-1.5 pl-2">
                       <button
                         type="button"
                         class="flex min-h-8 min-w-0 flex-1 items-center gap-3 rounded-md px-2 py-1 text-left transition hover:bg-raised"
                         :aria-expanded="expanded.has(endpointKey(endpoint.method, endpoint.path))"
                         :aria-controls="`${endpointID(endpointKey(endpoint.method, endpoint.path))}-detail`"
+                        @click="toggleEndpoint(endpointKey(endpoint.method, endpoint.path))"
                       >
                         <span
                           class="w-14 shrink-0 font-mono text-xs font-semibold"
@@ -954,15 +900,14 @@ function methodClass(method: string): string {
                           >{{ endpoint.method }}</span
                         >
                         <span
-                          class="flex min-w-0 flex-1 flex-col gap-x-3 @2xl:flex-row @2xl:items-baseline"
+                          class="flex min-w-0 flex-1 flex-col gap-x-3 lg:flex-row lg:items-baseline"
                         >
                           <code class="min-w-0 font-mono text-sm break-all text-gray-200">{{
                             endpoint.path
                           }}</code>
-                          <span
-                            class="min-w-0 text-xs text-gray-500 @2xl:ml-auto @2xl:text-right"
-                            >{{ t(endpoint.summary) }}</span
-                          >
+                          <span class="min-w-0 text-xs text-gray-500 lg:ml-auto lg:text-right">{{
+                            t(endpoint.summary)
+                          }}</span>
                         </span>
                         <DisclosureChevron
                           :open="expanded.has(endpointKey(endpoint.method, endpoint.path))"
@@ -979,7 +924,6 @@ function methodClass(method: string): string {
                             `${endpoint.method} ${endpoint.path}`,
                           )
                         "
-                        @click.stop
                       />
                     </div>
                     <UiCollapse :open="expanded.has(endpointKey(endpoint.method, endpoint.path))">
@@ -988,19 +932,19 @@ function methodClass(method: string): string {
                         class="space-y-4 border-t border-line/60 px-4 py-4"
                       >
                         <dl
-                          class="grid grid-cols-[minmax(0,1fr)] gap-x-4 gap-y-1 text-sm @lg:grid-cols-[8rem_minmax(0,1fr)] @lg:gap-y-2"
+                          class="grid grid-cols-[minmax(0,1fr)] gap-x-4 gap-y-1 text-sm sm:grid-cols-[8rem_minmax(0,1fr)] sm:gap-y-2"
                         >
                           <dt class="text-xs leading-5 text-gray-500">
                             {{ t('access.detail.protocol') }}
                           </dt>
-                          <dd class="mb-1.5 text-sm leading-5 text-gray-200 @lg:mb-0">
+                          <dd class="mb-1.5 text-sm leading-5 text-gray-200 sm:mb-0">
                             {{ group.name }}
                           </dd>
                           <dt class="text-xs leading-5 text-gray-500">
                             {{ t('access.detail.url') }}
                           </dt>
                           <dd
-                            class="mb-1.5 font-mono text-xs leading-5 break-all text-gray-200 @lg:mb-0"
+                            class="mb-1.5 font-mono text-xs leading-5 break-all text-gray-200 sm:mb-0"
                           >
                             <span :class="methodClass(endpoint.method)">{{ endpoint.method }}</span>
                             {{
@@ -1034,7 +978,7 @@ function methodClass(method: string): string {
                                 t('access.detail.inPath')
                               }}</span>
                               <span
-                                class="min-w-0 basis-full text-xs text-gray-400 @lg:basis-0 @lg:flex-1"
+                                class="min-w-0 basis-full text-xs text-gray-400 sm:basis-0 sm:flex-1"
                                 >{{ t(paramHelp[name] ?? 'access.param.id') }}</span
                               >
                             </li>

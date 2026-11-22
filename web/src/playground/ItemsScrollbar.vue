@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, onActivated, onMounted, onUnmounted, ref, watch } from 'vue'
+import { nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from '@/i18n'
 
 // ScrollbarItem 是轮次导航中的一个点：id 为该组第一个用户轮次，label 为提示文字
@@ -39,19 +39,16 @@ function turnElement(id: string): HTMLElement | null {
   return document.getElementById(`turn-${id}`)
 }
 
-// center returns the dot vertical center relative to the track top.
-function center(
-  index: number,
-  list = buttons(),
-  railTop = track.value?.getBoundingClientRect().top,
-): number | undefined {
-  const button = list[index]
-  if (button === undefined || railTop === undefined) return undefined
+// center 返回导航点圆心相对轨道顶部的位置
+function center(index: number): number | undefined {
+  const button = buttons()[index]
+  const rail = track.value
+  if (button === undefined || rail === undefined) return undefined
   const box = button.getBoundingClientRect()
-  return box.top + box.height / 2 - railTop
+  return box.top + box.height / 2 - rail.getBoundingClientRect().top
 }
 
-// updateActive selects the topmost visible turn or the closest turn above the viewport.
+// updateActive 与官网一致：顶部时为第一项、底部时为最后一项，否则为视口内顶边最靠上的轮次，视口内没有时取视口上方最近的一项
 function updateActive(): void {
   const scroller = props.scroller
   const items = props.items
@@ -66,22 +63,21 @@ function updateActive(): void {
     const view = scroller.getBoundingClientRect()
     let best: string | null = null
     let above: string | null = null
+    let offset = Infinity
     for (const item of items) {
       const rect = turnElement(item.id)?.getBoundingClientRect()
       if (rect === undefined) continue
-      if (rect.top >= view.bottom) break
-      if (rect.bottom <= view.top) {
-        above = item.id
-        continue
+      if (rect.bottom <= view.top) above = item.id
+      if (rect.top < view.bottom && rect.bottom > view.top && rect.top - view.top < offset) {
+        offset = rect.top - view.top
+        best = item.id
       }
-      best = item.id
-      break
     }
     active.value = best ?? above
   }
 }
 
-// updateHandle sizes and positions the thumb along the track.
+// updateHandle 按视口占比计算滑块高度，滑块停在当前轮次的点上，没有当前项时按滚动比例放置
 function updateHandle(): void {
   const scroller = props.scroller
   const rail = track.value
@@ -95,12 +91,9 @@ function updateHandle(): void {
     return
   }
   const count = props.items.length
-  if (count === 0) return
-  const list = buttons()
-  const railTop = rail.getBoundingClientRect().top
-  const first = center(0, list, railTop)
-  const last = center(count - 1, list, railTop)
-  if (first === undefined || last === undefined) return
+  const first = center(0)
+  const last = center(count - 1)
+  if (count === 0 || first === undefined || last === undefined) return
   const max = scroller.scrollHeight - scroller.clientHeight
   const ratio = max > 0 ? scroller.scrollTop / max : 0
   if (count === 1) {
@@ -120,7 +113,7 @@ function updateHandle(): void {
   if (dragging.value || jumping.value) return
   const range = span - height
   const index = props.items.findIndex((item) => item.id === active.value)
-  const anchor = index < 0 ? undefined : center(index, list, railTop)
+  const anchor = index < 0 ? undefined : center(index)
   const snapped =
     anchor === undefined
       ? first + ratio * range
@@ -132,77 +125,34 @@ function updateHandle(): void {
   handleTop.value = Math.max(first, Math.min(snapped, first + range))
 }
 
-// refreshFades updates the top and bottom edge fade flags of the rail container.
-function refreshFades(element: HTMLElement): void {
-  const isScrollable = element.scrollHeight > element.clientHeight
-  atTop.value = !isScrollable || element.scrollTop === 0
-  atBottom.value =
-    !isScrollable || element.scrollHeight - element.scrollTop - element.clientHeight < 1
-}
-
-// syncHostScroll keeps the active handle inside the visible rail window outside the 60px fade masks.
-function syncHostScroll(force = false): void {
-  const element = host.value
-  if (element === undefined || dragging.value || handleHeight.value <= 0) return
-  if (element.scrollHeight <= element.clientHeight) return
-  if (!force && element.matches(':focus-within')) return
-  if (!force && element.matches(':hover') && !props.scrolling) return
-  const viewTop = element.scrollTop
-  const viewHeight = element.clientHeight
-  const maxHost = element.scrollHeight - viewHeight
-  const margin = Math.max(0, Math.min(60, (viewHeight - handleHeight.value) / 2))
-  const handleBottom = handleTop.value + handleHeight.value
-  if (handleTop.value <= margin) element.scrollTop = 0
-  else if (handleBottom >= element.scrollHeight - margin) element.scrollTop = maxHost
-  else if (handleTop.value < viewTop + margin)
-    element.scrollTop = Math.max(0, handleTop.value - margin)
-  else if (handleBottom > viewTop + viewHeight - margin)
-    element.scrollTop = Math.min(maxHost, handleBottom - (viewHeight - margin))
-}
-
-// update refreshes active item, handle geometry, and edge fade state.
+// update 刷新当前项、滑块与上下渐隐
 function update(): void {
   updateActive()
   updateHandle()
-  if (host.value !== undefined) refreshFades(host.value)
+  const element = host.value
+  if (element === undefined) return
+  const scrollable = element.scrollHeight > element.clientHeight
+  atTop.value = !scrollable || element.scrollTop === 0
+  atBottom.value =
+    !scrollable || element.scrollHeight - element.scrollTop - element.clientHeight < 1
 }
 
-// sync refreshes active item, handle geometry, rail scroll position, and edge fade state.
-function sync(force = false): void {
-  updateActive()
-  updateHandle()
-  syncHostScroll(force)
-  if (host.value !== undefined) refreshFades(host.value)
-}
-
-// jump scrolls to the turn associated with the dot without locking jumping on no-op scrolls.
+// jump 滚动到导航点对应的轮次：第一项到顶部，最后一项到底部，其余把轮次顶边对齐视口
 function jump(id: string): void {
   const scroller = props.scroller
   const element = turnElement(id)
   if (scroller === undefined || element === null) return
   const index = props.items.findIndex((item) => item.id === id)
-  const maxScroll = scroller.scrollHeight - scroller.clientHeight
-  const delta = element.getBoundingClientRect().top - scroller.getBoundingClientRect().top
-  const clampedDelta =
-    delta > 0
-      ? Math.min(delta, Math.max(0, maxScroll - scroller.scrollTop))
-      : Math.max(delta, -scroller.scrollTop)
-  const atTarget =
-    (index === 0 && scroller.scrollTop <= 0) ||
-    (index === props.items.length - 1 && maxScroll - scroller.scrollTop < 1) ||
-    (index > 0 && index < props.items.length - 1 && Math.abs(clampedDelta) < 1)
   active.value = id
-  if (!atTarget) {
-    jumping.value = true
-    scroller.addEventListener(
-      'scrollend',
-      () => {
-        jumping.value = false
-        update()
-      },
-      { once: true },
-    )
-  }
+  jumping.value = true
+  scroller.addEventListener(
+    'scrollend',
+    () => {
+      jumping.value = false
+      update()
+    },
+    { once: true },
+  )
   if (index === 0) scroller.scrollTo({ top: 0, behavior: 'smooth' })
   else if (index === props.items.length - 1)
     scroller.scrollTo({ top: scroller.scrollHeight, behavior: 'smooth' })
@@ -219,16 +169,15 @@ function jump(id: string): void {
   scroller.focus({ preventScroll: true })
 }
 
-// drag maps the pointer Y coordinate between the first and last dot onto the scroll range.
+// drag 把指针位置换算为对话滚动位置：第一个点到最后一个点之间对应整个滚动范围
 function drag(clientY: number): void {
   const scroller = props.scroller
   const rail = track.value
   if (scroller === undefined || rail === undefined) return
-  const list = buttons()
-  const top = rail.getBoundingClientRect().top
-  const first = center(0, list, top)
-  const last = center(props.items.length - 1, list, top)
+  const first = center(0)
+  const last = center(props.items.length - 1)
   if (first === undefined || last === undefined) return
+  const top = rail.getBoundingClientRect().top
   const end =
     props.items.length === 1 ? rail.clientHeight - handleHeight.value : last - handleHeight.value
   const position = Math.max(first, Math.min(clientY - top - grab, end))
@@ -311,10 +260,10 @@ function onFocusIn(event: FocusEvent): void {
 }
 
 let frame = 0
-// schedule coalesces rail updates onto the next animation frame.
+// schedule 在下一帧合并刷新
 function schedule(): void {
   cancelAnimationFrame(frame)
-  frame = requestAnimationFrame(() => sync())
+  frame = requestAnimationFrame(update)
 }
 
 watch(
@@ -337,16 +286,10 @@ watch(
 )
 
 onMounted(() => {
-  cancelAnimationFrame(frame)
-  sync(true)
   document.addEventListener('mousemove', onPointerMove)
   document.addEventListener('touchmove', onPointerMove, { passive: false })
   document.addEventListener('mouseup', stopDrag)
   document.addEventListener('touchend', stopDrag)
-})
-
-onActivated(() => {
-  if (host.value) sync(true)
 })
 
 onUnmounted(() => {
@@ -387,10 +330,9 @@ defineExpose({ focusActive })
     <div ref="track" class="scrollbar-track">
       <div class="scrollbar-line"></div>
       <div
-        v-show="handleHeight > 0"
         ref="handle"
         class="scrollbar-handle"
-        :style="{ transform: `translate3d(-50%, ${handleTop}px, 0)`, height: `${handleHeight}px` }"
+        :style="{ top: `${handleTop}px`, height: `${handleHeight}px` }"
         @mousedown="startDrag"
         @touchstart="startDrag"
       ></div>
@@ -504,7 +446,6 @@ defineExpose({ focusActive })
 .scrollbar-handle {
   position: absolute;
   z-index: 1;
-  top: 0;
   left: 50%;
   width: 8px;
   min-height: 80px;
@@ -514,7 +455,7 @@ defineExpose({ focusActive })
   transform: translateX(-50%);
   transition:
     background-color 0.2s ease-in-out,
-    transform 0.6s ease-in-out;
+    top 0.6s ease-in-out;
 }
 
 .scrollbar-handle:hover {

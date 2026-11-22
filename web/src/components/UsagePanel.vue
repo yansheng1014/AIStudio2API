@@ -2,15 +2,14 @@
 import { computed, onActivated, onDeactivated, provide, ref, shallowRef, watch } from 'vue'
 import { api } from '@/api'
 import { useI18n } from '@/i18n'
-import type { Model, UsageDimension, UsagePair, UsageReport, UsageStats } from '@/types'
+import type { Model, UsageDimension, UsageReport, UsageStats } from '@/types'
 import UiIcon from './UiIcon.vue'
-import UiSelect, { keepSelected } from './UiSelect.vue'
+import UiSelect from './UiSelect.vue'
 import FilterMenu from './FilterMenu.vue'
 import KpiCard from './usage/KpiCard.vue'
 import RangePicker from './usage/RangePicker.vue'
 import RankingTable from './usage/RankingTable.vue'
 import RecordsTable from './usage/RecordsTable.vue'
-import RefreshButton from './usage/RefreshButton.vue'
 import UsageCharts from './usage/UsageCharts.vue'
 import { usageClock, useUsageFormat } from './usage/format'
 import { readPreference, writePreference } from '@/preference'
@@ -26,7 +25,8 @@ import {
 
 const props = defineProps<{ models: Model[] }>()
 const { t, errorText } = useI18n()
-const { compact, integer, usd, percent, duration, dateTime, dimensionLabel } = useUsageFormat()
+const { compact, integer, usd, percent, duration, dateTime, clock, ago, dimensionLabel } =
+  useUsageFormat()
 const state = useUsageState()
 
 // filterOptions 返回筛选候选，模型按模型目录顺序排列，目录外的取值排在最后
@@ -56,9 +56,7 @@ const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone
 let controller: AbortController | undefined
 let clockTimer: number | undefined
 
-// minute 是取整到分钟的时钟，时间范围只显示到分钟
-const minute = computed(() => Math.floor(now.value / 60_000) * 60_000)
-const resolved = computed(() => resolveRange(state, new Date(minute.value)))
+const resolved = computed(() => resolveRange(state, new Date(now.value)))
 const live = computed(() => liveRange(state.range))
 const hasFilters = computed(() => dimensions.some((item) => (state.filters[item] ?? []).length > 0))
 const scope = computed(() => JSON.stringify([state.range, state.from, state.to, state.filters]))
@@ -85,6 +83,7 @@ async function load(): Promise<void> {
   }
   query.set('tz', timezone)
   query.set('stack', state.stack)
+  query.set('pairs', '0')
   controller?.abort()
   const current = new AbortController()
   controller = current
@@ -104,12 +103,17 @@ async function load(): Promise<void> {
   }
 }
 
-// loadPairs 读取当前范围与筛选下一个账户或模型的组合明细
-async function loadPairs(dimension: 'account' | 'model', key: string): Promise<UsagePair[]> {
+// loadPairs 读取当前范围与筛选下一个账户或模型的组合明细，主报告不含组合明细
+async function loadPairs(
+  dimension: 'account' | 'model',
+  key: string,
+): Promise<UsageReport['pairs']> {
   const query = baseQuery()
   if (query === null) throw new Error(t('usage.rangeInvalid'))
   query.set(dimension, key)
-  return api.usagePairs(query)
+  query.set('tz', timezone)
+  query.set('stack', state.stack)
+  return (await api.usage(query, new AbortController().signal)).pairs
 }
 
 // refresh 立即刷新报告与请求记录
@@ -183,6 +187,20 @@ const activeChips = computed(() =>
     (state.filters[dimension] ?? []).map((value) => ({ dimension, value })),
   ),
 )
+
+// refreshTip 是刷新按钮的提示：数据更新时间与账本中最新请求距今多久
+const refreshTip = computed(() => {
+  const latest = report.value?.latest_at
+  return [
+    t('app.refresh'),
+    updatedAt.value > 0 && t('usage.updatedAt').replace('{time}', clock(new Date(updatedAt.value))),
+    latest === undefined
+      ? t('usage.latestNone')
+      : t('usage.latest').replace('{time}', ago(latest, now.value)),
+  ]
+    .filter(Boolean)
+    .join(' · ')
+})
 
 // relative 返回相对变化比例，上一周期为 0 时返回 null
 function relative(current: number, previous: number): number | null {
@@ -354,34 +372,33 @@ const kpis = computed(() => {
 })
 
 const statusOptions = computed(() =>
-  keepSelected(
-    (report.value?.groups.status ?? []).map((group) => group.key).sort(),
-    state.status,
-    '',
-  ),
+  (report.value?.groups.status ?? []).map((group) => group.key).sort(),
 )
 </script>
 
 <template>
-  <section class="relative flex min-h-0 flex-1 flex-col overflow-auto [scrollbar-gutter:stable]">
-    <header class="page-x flex flex-wrap items-center gap-3 border-b border-line py-4">
+  <section class="flex min-h-0 flex-1 flex-col overflow-auto [scrollbar-gutter:stable]">
+    <header class="flex flex-wrap items-center gap-3 border-b border-line px-4 py-4 md:px-8">
       <div class="min-w-0 flex-1">
         <h2 class="text-xl font-semibold text-white">{{ t('usage.title') }}</h2>
         <p class="mt-1 text-sm text-gray-500">{{ t('usage.description') }}</p>
       </div>
-      <div class="flex h-10 items-stretch rounded border border-line text-sm">
-        <RefreshButton
-          :loading="loading"
-          :live="live"
-          :updated-at="updatedAt"
-          :latest-at="report?.latest_at"
-          @refresh="refresh"
-        />
+      <div class="flex h-8 items-stretch rounded-md border border-line text-xs">
+        <button
+          v-tooltip="refreshTip"
+          type="button"
+          class="flex w-8 items-center justify-center text-gray-400 transition hover:bg-raised hover:text-white"
+          :class="live ? 'rounded-l-md' : 'rounded-md'"
+          :aria-label="t('app.refresh')"
+          @click="refresh"
+        >
+          <UiIcon name="refresh" :size="14" :class="{ 'animate-spin': loading }" />
+        </button>
         <UiSelect
           v-if="live"
           :model-value="autoRefresh"
           :aria-label="t('usage.autoRefresh')"
-          class="w-max rounded-r border-l border-line px-3 text-gray-200 hover:bg-raised"
+          class="w-max rounded-r-md border-l border-line px-2.5 text-gray-200 hover:bg-raised"
           @update:model-value="autoRefresh = Number($event)"
         >
           <option v-for="choice in refreshChoices" :key="choice" :value="choice">
@@ -392,7 +409,7 @@ const statusOptions = computed(() =>
     </header>
 
     <div
-      class="page-x sticky top-0 z-10 flex flex-wrap items-center gap-2 border-b border-line bg-canvas/95 py-2.5 backdrop-blur"
+      class="sticky top-0 z-10 flex flex-wrap items-center gap-2 border-b border-line bg-canvas/95 px-4 py-2.5 backdrop-blur md:px-8"
       role="toolbar"
       :aria-label="t('usage.filters')"
     >
@@ -419,7 +436,7 @@ const statusOptions = computed(() =>
         {{ t('usage.filtersClear') }}
       </button>
     </div>
-    <div v-if="activeChips.length > 0" class="page-x flex flex-wrap gap-1.5 pt-3">
+    <div v-if="activeChips.length > 0" class="flex flex-wrap gap-1.5 px-4 pt-3 md:px-8">
       <span
         v-for="chip in activeChips"
         :key="`${chip.dimension}:${chip.value}`"
@@ -447,7 +464,7 @@ const statusOptions = computed(() =>
       </span>
     </div>
 
-    <div class="@container page-x space-y-4 py-4 md:py-8">
+    <div class="@container w-full space-y-4 p-4 md:p-8">
       <div
         v-if="error && status !== 'error'"
         class="flex items-center gap-3 rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-300"

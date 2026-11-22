@@ -18,10 +18,6 @@ import (
 const (
 	// MakerSuiteRPCBase 是 AI Studio RPC 根地址
 	MakerSuiteRPCBase = "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/"
-	// appletControlRPCBase 是 Build 应用文件系统 RPC 根地址
-	appletControlRPCBase = "https://alkalimakersuite-pa.clients6.google.com/$rpc/google.alkali.boq.makersuite.makersuiteappletcontrol.proto.MakersuiteAppletControlService/"
-	// appletAuthRPCBase 是 Build 应用开发环境认证 RPC 根地址
-	appletAuthRPCBase = "https://alkalimakersuiteapplets.pa.clients6.google.com/$rpc/google.internal.alkali.applications.makersuite.v1.applets.AppletAuthService/"
 	// JSONProtobufContentType 是 MakerSuite 使用的数组协议媒体类型
 	JSONProtobufContentType = "application/json+protobuf"
 )
@@ -34,17 +30,14 @@ type RPCRequest struct {
 	RequestID string
 	Header    http.Header
 	Body      []byte
-	// ProofAt 是受保护请求编码 Body 时给出的 WAA proof 字段占位 null 的起始字节
-	ProofAt   int
 	Streaming bool
 }
 
-// RPCResponse 描述认证传输层返回的响应头和实时正文，Proof 为受保护请求写入的 WAA proof
+// RPCResponse 描述认证传输层返回的响应头和实时正文
 type RPCResponse struct {
 	StatusCode int
 	Header     http.Header
 	Body       io.ReadCloser
-	Proof      string
 }
 
 // RPCTransport 负责认证、账户租约、Cookie 写回和真实网络发送
@@ -73,7 +66,6 @@ type ClientOptions struct {
 	Protected       ProtectedTransport
 	ContextProvider RequestContextProvider
 	Pages           PageCatalogProvider
-	Static          StaticFetcher
 }
 
 // Client 实现 AI Studio 私有协议核心
@@ -82,7 +74,6 @@ type Client struct {
 	protected       ProtectedTransport
 	contextProvider RequestContextProvider
 	pages           PageCatalogProvider
-	static          StaticFetcher
 	catalogMu       sync.RWMutex
 	catalogs        map[string]modelCatalog
 	tierMu          sync.RWMutex
@@ -90,11 +81,8 @@ type Client struct {
 	termsMu         sync.Mutex
 	termsAccepted   map[string]struct{}
 	disclaimers     map[string]struct{}
+	assistants      *assistantSessions
 	turns           *modelTurnHistory
-	assistants      *assistantAppletCache
-	frontendMu      sync.Mutex
-	// frontend 是按地址解析过的官网前端主程序推荐模型
-	frontend map[string]frontendModels
 }
 
 // NewClient 创建协议客户端
@@ -104,14 +92,12 @@ func NewClient(options ClientOptions) *Client {
 		protected:       options.Protected,
 		contextProvider: options.ContextProvider,
 		pages:           options.Pages,
-		static:          options.Static,
 		catalogs:        make(map[string]modelCatalog),
 		tiers:           make(map[string]BenefitTier),
 		termsAccepted:   make(map[string]struct{}),
 		disclaimers:     make(map[string]struct{}),
+		assistants:      newAssistantSessions(),
 		turns:           newModelTurnHistory(),
-		assistants:      newAssistantAppletCache(),
-		frontend:        make(map[string]frontendModels),
 	}
 }
 
@@ -123,8 +109,6 @@ type RPCError struct {
 	Message    string
 	Metadata   map[string]string
 	RetryDelay time.Duration
-	// PerUserQuota 表示写代码助手步骤失败带每用户额度标记
-	PerUserQuota bool
 }
 
 // ContextOverflow 返回错误是否为上游报告的输入 token 超过模型上限
@@ -132,18 +116,15 @@ func (e *RPCError) ContextOverflow() bool {
 	return e.StatusCode == http.StatusBadRequest && strings.Contains(e.Message, "input token count exceeds the maximum number of tokens allowed")
 }
 
-// accessDenial 返回官网对该 403、协议错误码 7 的消息跳转的拒绝原因，其他错误返回 nil
-func (e *RPCError) accessDenial() *camoufoxnative.AccessDenial {
-	if e.StatusCode != http.StatusForbidden || e.Code != 7 {
-		return nil
-	}
-	return camoufoxnative.DenialForMessage(e.Message)
+// regionNotSupported 返回上游是否以官网跳转地区不可用页的错误拒绝当前出口地区或账户
+func (e *RPCError) regionNotSupported() bool {
+	return e.StatusCode == http.StatusForbidden && e.Code == 7 && (e.Message == "Region not supported." || e.Message == "Account not supported.")
 }
 
 // Error 返回结构化上游错误
 func (e *RPCError) Error() string {
-	if denial := e.accessDenial(); denial != nil {
-		return fmt.Sprintf("AI Studio %s 返回 HTTP %d、协议错误码 %d: %s（%v）", e.Method, e.StatusCode, e.Code, e.Message, denial)
+	if e.regionNotSupported() {
+		return fmt.Sprintf("AI Studio %s 返回 HTTP %d、协议错误码 %d: %s（%v，官网跳转 %s）", e.Method, e.StatusCode, e.Code, e.Message, camoufoxnative.ErrRegionNotSupported, camoufoxnative.AvailableRegionsURL)
 	}
 	if e.Code != 0 {
 		return fmt.Sprintf("AI Studio %s 返回 HTTP %d、协议错误码 %d: %s", e.Method, e.StatusCode, e.Code, e.Message)
@@ -151,22 +132,10 @@ func (e *RPCError) Error() string {
 	return fmt.Sprintf("AI Studio %s 返回 HTTP %d: %s", e.Method, e.StatusCode, e.Message)
 }
 
-// StatusError 以 gRPC 状态名代替 HTTP 状态码写出 401 或 403 的上游方法、协议错误码与原因
-func (e *RPCError) StatusError() string {
-	status := "PERMISSION_DENIED"
-	if e.StatusCode == http.StatusUnauthorized {
-		status = "UNAUTHENTICATED"
-	}
-	if e.Code != 0 {
-		return fmt.Sprintf("AI Studio %s 返回 %s、协议错误码 %d: %s", e.Method, status, e.Code, e.Message)
-	}
-	return fmt.Sprintf("AI Studio %s 返回 %s: %s", e.Method, status, e.Message)
-}
-
-// Unwrap 把官网会跳转拒绝页的错误映射为对应的 camoufoxnative.AccessDenial
+// Unwrap 把地区或账户不受支持的错误映射为 camoufoxnative.ErrRegionNotSupported
 func (e *RPCError) Unwrap() error {
-	if denial := e.accessDenial(); denial != nil {
-		return denial
+	if e.regionNotSupported() {
+		return camoufoxnative.ErrRegionNotSupported
 	}
 	return nil
 }
@@ -185,22 +154,17 @@ func (e *RPCError) RetryAt(now time.Time) time.Time {
 }
 
 func (c *Client) do(ctx context.Context, method string, accountID string, requestID string, body []byte, streaming bool) (*RPCResponse, error) {
-	return c.send(ctx, newRPCRequest(method, accountID, requestID, body, streaming))
-}
-
-// send 发送 RPC 请求并校验响应状态与媒体类型
-func (c *Client) send(ctx context.Context, rpc RPCRequest) (*RPCResponse, error) {
-	c.applyBenefitTier(rpc.Method, rpc.AccountID, rpc.Header)
+	rpc := newRPCRequest(method, accountID, requestID, body, streaming)
+	c.applyBenefitTier(method, accountID, rpc.Header)
 	response, err := c.transport.Do(ctx, rpc)
 	if err != nil {
-		return nil, fmt.Errorf("发送 AI Studio %s: %w", rpc.Method, err)
+		return nil, fmt.Errorf("发送 AI Studio %s: %w", method, err)
 	}
-	return validateRPCResponse(rpc.Method, response)
+	return validateRPCResponse(method, response)
 }
 
-func (c *Client) doProtected(ctx context.Context, request GenerateRequest, body []byte, proofAt int) (*RPCResponse, error) {
+func (c *Client) doProtected(ctx context.Context, request GenerateRequest, body []byte) (*RPCResponse, error) {
 	rpc := newRPCRequest("GenerateContent", request.AccountID, request.ID, body, true)
-	rpc.ProofAt = proofAt
 	c.applyBenefitTier(rpc.Method, request.AccountID, rpc.Header)
 	if request.ImageRoute {
 		// 图像请求使用独立于文本预热页的扩展头默认值

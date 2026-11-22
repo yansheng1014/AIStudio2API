@@ -16,11 +16,9 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/sync/singleflight"
 )
 
-const publicDiscoveryUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:158.0) Gecko/20100101 Firefox/158.0"
+const publicDiscoveryUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0"
 
 var makerSuiteAPIKeyPattern = regexp.MustCompile(`"WIu0Nc":"([^"]+)"`)
 
@@ -58,26 +56,10 @@ type MakerSuiteHTTPTransport struct {
 	driveMu sync.Mutex
 	// driveDiscovered 记录已按官网页面读取 Drive discovery 文档的账户
 	driveDiscovered map[string]bool
-	// driveDiscovery 按账户合并同时进行的 Drive discovery 读取
-	driveDiscovery singleflight.Group
 }
 
 type accountLeaseContextKey struct{}
 type accountSelectionObserverContextKey struct{}
-
-// residentCatalogContextKey 是 context 中要求账户目录读取在常驻 Worker 的页面上进行的键
-type residentCatalogContextKey struct{}
-
-// ContextWithResidentCatalog 返回要求账户目录读取在常驻 Worker 的页面上进行、不临时载入页面的 ctx
-func ContextWithResidentCatalog(ctx context.Context) context.Context {
-	return context.WithValue(ctx, residentCatalogContextKey{}, true)
-}
-
-// ResidentCatalog 判断 ctx 是否要求账户目录读取在常驻 Worker 的页面上进行
-func ResidentCatalog(ctx context.Context) bool {
-	resident, _ := ctx.Value(residentCatalogContextKey{}).(bool)
-	return resident
-}
 
 // ContextWithAccountLease 将上层已持有的租约传给协议传输
 func ContextWithAccountLease(ctx context.Context, lease *AccountLease) context.Context {
@@ -90,14 +72,14 @@ func AccountLeaseFromContext(ctx context.Context) (*AccountLease, bool) {
 	return lease, ok && lease != nil && lease.Account() != nil
 }
 
-// ContextWithAccountSelectionObserver 观察请求最终取得的账户租约
-func ContextWithAccountSelectionObserver(ctx context.Context, observer func(*AccountLease)) context.Context {
+// ContextWithAccountSelectionObserver 观察请求最终选择的账户
+func ContextWithAccountSelectionObserver(ctx context.Context, observer func(*Account)) context.Context {
 	return context.WithValue(ctx, accountSelectionObserverContextKey{}, observer)
 }
 
-func observeAccountSelection(ctx context.Context, lease *AccountLease) {
-	if observer, ok := ctx.Value(accountSelectionObserverContextKey{}).(func(*AccountLease)); ok {
-		observer(lease)
+func observeAccountSelection(ctx context.Context, account *Account) {
+	if observer, ok := ctx.Value(accountSelectionObserverContextKey{}).(func(*Account)); ok {
+		observer(account)
 	}
 }
 
@@ -288,7 +270,7 @@ func (t *MakerSuiteHTTPTransport) UploadAssistantFile(ctx context.Context, accou
 	return path, nil
 }
 
-// Do 发送普通 MakerSuite RPC 并让响应 body 持有租约，账户有 WAA Worker 时 pageIssuedRPCs 中的方法与 issuedByPage 上下文中的请求由页面发出
+// Do 发送普通 MakerSuite RPC 并让响应 body 持有租约
 func (t *MakerSuiteHTTPTransport) Do(ctx context.Context, rpc RPCRequest) (*RPCResponse, error) {
 	lease, owned, err := resolveAccountLease(ctx, t.pool, AccountSelection{AccountID: rpc.AccountID})
 	if err != nil {
@@ -301,20 +283,6 @@ func (t *MakerSuiteHTTPTransport) Do(ctx context.Context, rpc RPCRequest) (*RPCR
 		return errors.Join(requestErr, lease.Release())
 	}
 	account := lease.Account()
-	finish := func() error {
-		if owned {
-			return lease.Release()
-		}
-		return nil
-	}
-	if worker := pageWorker(account.ID); worker != nil && (pageIssuedRPCs[rpc.Method] || ctx.Value(pageIssuedKey{}) != nil) {
-		response, err := worker.SendPageRPC(ctx, t.signer, rpc)
-		if err != nil {
-			return nil, releaseOnError(fmt.Errorf("页面发送 MakerSuite %s 请求: %w", rpc.Method, err))
-		}
-		response.Body = &leaseResponseBody{body: response.Body, finish: finish}
-		return response, nil
-	}
 	_, headers, err := prepareProtocolHeaders(ctx, lease, rpc, t.signer, t.headers, t.now(), true)
 	if err != nil {
 		return nil, releaseOnError(err)
@@ -338,37 +306,16 @@ func (t *MakerSuiteHTTPTransport) Do(ctx context.Context, rpc RPCRequest) (*RPCR
 			return nil, releaseOnError(fmt.Errorf("合并 MakerSuite %s 响应 Cookie: %w", rpc.Method, err))
 		}
 	}
-	body := &leaseResponseBody{body: response.Body, finish: finish}
+	body := &leaseResponseBody{
+		body: response.Body,
+		finish: func() error {
+			if owned {
+				return lease.Release()
+			}
+			return nil
+		},
+	}
 	return &RPCResponse{StatusCode: response.StatusCode, Header: response.Header.Clone(), Body: body}, nil
-}
-
-// pageIssuedRPCs 是官网页面为对话附件上传自己发出的 RPC，账户有 WAA Worker 时由页面以页面的登录凭据发出
-var pageIssuedRPCs = map[string]bool{"GenerateAccessToken": true, "GetAppFolder": true}
-
-// FetchStatic 经账户的固定出口以 GET 读取官网静态资源
-func (t *MakerSuiteHTTPTransport) FetchStatic(ctx context.Context, accountID string, address string) ([]byte, error) {
-	account, err := t.pool.Account(accountID)
-	if err != nil {
-		return nil, err
-	}
-	client, err := t.clientForProxy(account.EffectiveProxy(t.globalProxy))
-	if err != nil {
-		return nil, err
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
-	if err != nil {
-		return nil, err
-	}
-	request.Header.Set("User-Agent", publicDiscoveryUserAgent)
-	response, err := sendHTTP(client, request)
-	if err != nil {
-		return nil, err
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d", response.StatusCode)
-	}
-	return io.ReadAll(response.Body)
 }
 
 // CloseIdleConnections 关闭全部固定出口的空闲连接
@@ -455,71 +402,19 @@ func prepareProtocolHeaders(
 	return state, headers, nil
 }
 
-// CooldownQueueLimit 为全部候选账户冷却时一个请求排队等待恢复的累计上限，覆盖分钟限额窗口
-const CooldownQueueLimit = time.Minute
-
-// QueuedCoolingError 返回全部候选账户冷却时的排队结果：最早恢复的冷却在已排队 queued 之后的上限内、不晚于 ctx 的期限且不是权限拒绝冷却时为 nil，否则为 AllCoolingError
-func QueuedCoolingError(ctx context.Context, modelID string, cooldown CooldownState, queued time.Duration) error {
-	deadline, bounded := ctx.Deadline()
-	if time.Until(cooldown.Until) <= CooldownQueueLimit-queued && !(bounded && cooldown.Until.After(deadline)) &&
-		!strings.HasPrefix(cooldown.Reason, AccountRejectionKind) {
-		return nil
-	}
-	return &AllCoolingError{ModelID: modelID, Until: cooldown.Until, Reason: cooldown.Reason}
-}
-
-// resourceOwnerError 返回资源 resourceID 属于账户 owner、与指定的账户 accountID 不同时的错误
-func resourceOwnerError(resourceID, owner, accountID string) error {
-	return fmt.Errorf("%w：资源 %s 属于账户 %s，与指定的账户 %s 不同", ErrNoEligibleAccount, resourceID, owner, accountID)
-}
-
-// queueRecheck 是排队取得租约时重新判断候选账户是否全部冷却的间隔
-const queueRecheck = time.Second
-
-// acquireQueuedLease 与 resolveAccountLease 一样取得租约，每隔 queueRecheck 重新判断候选账户，全部冷却时累计排队时间，超过 QueuedCoolingError 的上限时返回它的错误
-func acquireQueuedLease(ctx context.Context, pool *AccountPool, selection AccountSelection) (*AccountLease, bool, error) {
-	if _, ok := AccountLeaseFromContext(ctx); ok {
-		return resolveAccountLease(ctx, pool, selection)
-	}
-	var cooled time.Duration
-	for {
-		groups, err := pool.ClassifyCandidates(ctx, selection, nil)
-		if err != nil {
-			return nil, false, err
-		}
-		available := len(groups.WarmReady) + len(groups.WarmAvailable) + len(groups.WarmBusy) + len(groups.StandbyReady) + len(groups.StandbyBusy)
-		cooling := available == 0 && !groups.EarliestCooldown.Until.IsZero()
-		if cooling {
-			if err := QueuedCoolingError(ctx, selection.ModelID, groups.EarliestCooldown, cooled); err != nil {
-				return nil, false, err
-			}
-		}
-		waitCtx, cancel := context.WithTimeout(ctx, queueRecheck)
-		started := time.Now()
-		lease, owned, err := resolveAccountLease(waitCtx, pool, selection)
-		cancel()
-		if cooling {
-			cooled += time.Since(started)
-		}
-		if err == nil || ctx.Err() != nil || !errors.Is(err, context.DeadlineExceeded) {
-			return lease, owned, err
-		}
-	}
-}
-
 func resolveAccountLease(ctx context.Context, pool *AccountPool, selection AccountSelection) (*AccountLease, bool, error) {
 	if lease, ok := AccountLeaseFromContext(ctx); ok {
 		if err := validateLeaseSelection(lease, selection); err != nil {
 			return nil, false, err
 		}
-		observeAccountSelection(ctx, lease)
+		observeAccountSelection(ctx, lease.Account())
 		return lease, false, nil
 	}
 	lease, err := pool.AcquireFor(ctx, selection)
 	if err != nil {
 		return nil, false, err
 	}
-	observeAccountSelection(ctx, lease)
+	observeAccountSelection(ctx, lease.Account())
 	return lease, true, nil
 }
 
@@ -551,7 +446,7 @@ func validateLeaseSelection(lease *AccountLease, selection AccountSelection) err
 			return ErrResourceNotFound
 		}
 		if owner != account.ID {
-			return resourceOwnerError(resourceID, owner, account.ID)
+			return fmt.Errorf("资源 %s 绑定账户 %s", resourceID, owner)
 		}
 	}
 	if selection.Channel != "" && generationChannelSelection(selection) && lease.Channel() != selection.Channel {
