@@ -18,6 +18,7 @@ func (s *server) handleResponsesInputTokens(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	prepared, err := s.prepareResponses(r.Context(), &request, newID("count"), false)
+	request.Input, request.split = nil, splitInput{}
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())

@@ -3,7 +3,6 @@ package app
 import (
 	"cmp"
 	"context"
-	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -84,10 +83,13 @@ func (stats *firstEventStats) latencies(now time.Time) []api.FirstEventLatency {
 	return latencies
 }
 
-// seed 从请求账本的近期记录补入原请求样本：被备用请求取代的原请求取其已等时长，其余只含落败备用请求或没有尝试记录的取首事件减排队
+// seed 从请求账本的近期记录补入原请求样本：跳过开启回复工具的请求；被备用请求取代的原请求取其已等时长，其余只含落败备用请求或没有尝试记录的取首事件减排队
 func (stats *firstEventStats) seed(records []api.UsageRecord) {
 	slices.SortFunc(records, func(a, b api.UsageRecord) int { return a.Time.Compare(b.Time) })
 	for _, record := range records {
+		if record.ReplyTool {
+			continue
+		}
 		model := strings.TrimPrefix(record.Model, "models/")
 		superseded := slices.IndexFunc(record.Attempts, func(attempt api.RequestAttempt) bool { return attempt.Superseded && !attempt.Hedge })
 		switch {
@@ -120,10 +122,18 @@ func percentile95(waits []time.Duration) time.Duration {
 	return waits[(len(waits)*95+99)/100-1]
 }
 
+// canHedge 判断请求是否允许在等待首事件超时后发起备用请求，后台任务、助手模型与开启回复工具的请求不发起备用请求
+func (service *trackedService) canHedge(request aistudio.GenerateRequest, assistant bool, modelID string) bool {
+	policy := service.currentFirstEventPolicy()
+	return !request.Background && !assistant && !request.ReplyTool &&
+		(policy.hedgeAuto || policy.hedgeAfter > 0) && slices.Contains(policy.hedgeModels, modelID)
+}
+
 // hedgeDelay 返回原请求等待首事件多久后发起备用请求，不发起时第二个返回值为 false
 func (service *trackedService) hedgeDelay(modelID, channel string) (time.Duration, bool) {
-	if !service.hedgeAuto {
-		return service.hedgeAfter, service.hedgeAfter > 0
+	policy := service.currentFirstEventPolicy()
+	if !policy.hedgeAuto {
+		return policy.hedgeAfter, policy.hedgeAfter > 0
 	}
 	p95, samples := service.requests.firstEvents.p95(modelID, channel, time.Now())
 	return p95, samples >= firstEventMinSamples
@@ -139,8 +149,7 @@ func (service *trackedService) hedgeSelections(primary aistudio.AccountSelection
 	}
 	other := primary
 	other.AllowedAccountIDs = nil
-	enabled, _ := service.pool.EnabledAccounts()
-	for _, id := range enabled {
+	for _, id := range service.pool.EnabledAccounts() {
 		if _, tried := attempted[id]; !tried {
 			other.AllowedAccountIDs = append(other.AllowedAccountIDs, id)
 		}
@@ -209,12 +218,12 @@ func (service *trackedService) awaitFirstEvent(
 			primaryDone = nil
 			check = nil
 			if primary.err == nil {
-				service.requests.firstEvents.observe(modelID, string(primary.lease.Channel()), primary.firstAt, primary.firstAt.Sub(primary.startedAt))
+				if !request.ReplyTool {
+					service.requests.firstEvents.observe(modelID, string(primary.lease.Channel()), primary.firstAt, primary.firstAt.Sub(primary.startedAt))
+				}
 				if hedgeDone != nil {
 					service.supersede(requestCtx, request.ID, hedge, "原请求先返回首事件")
-					service.requests.logRequestProgress(request.ID, primary.accountLabel, "INFO", fmt.Sprintf(
-						"原请求胜出 | 取消备用请求 | 备用账户=%s | 模型=%s", hedge.accountLabel, modelID,
-					))
+					service.requests.logRequestProgress(request.ID, primary.accountLabel, "INFO", "原请求胜出，取消备用请求", "hedge_account", hedge.accountLabel, "model", modelID)
 				}
 				return primary
 			}
@@ -224,12 +233,12 @@ func (service *trackedService) awaitFirstEvent(
 			if hedge.err == nil {
 				waited := time.Since(primary.startedAt)
 				if primaryDone != nil {
-					service.requests.firstEvents.observe(modelID, string(primary.lease.Channel()), time.Now(), waited)
+					if !request.ReplyTool {
+						service.requests.firstEvents.observe(modelID, string(primary.lease.Channel()), time.Now(), waited)
+					}
 					service.supersede(requestCtx, request.ID, primary, "备用请求先返回首事件")
 				}
-				service.requests.logRequestProgress(request.ID, hedge.accountLabel, "INFO", fmt.Sprintf(
-					"备用请求胜出 | 账户=%s | 原请求已等待=%s | 模型=%s", hedge.accountLabel, waited.Round(time.Millisecond), modelID,
-				))
+				service.requests.logRequestProgress(request.ID, hedge.accountLabel, "INFO", "备用请求胜出", "primary_waited", waited, "model", modelID)
 				return hedge
 			}
 			failed(hedge, primaryDone != nil && primary.lease.Account().ID == hedge.lease.Account().ID)
@@ -248,10 +257,8 @@ func (service *trackedService) awaitFirstEvent(
 			}
 			hedge = plan.start(lease, selection)
 			hedgeDone = hedge.done
-			service.requests.logRequestProgress(request.ID, hedge.accountLabel, "WARN", fmt.Sprintf(
-				"备用请求发起 | 账户=%s | 原请求已等待=%s | 阈值=%s | 模型=%s",
-				hedge.accountLabel, time.Since(primary.startedAt).Round(time.Millisecond), plan.delay.Round(time.Millisecond), modelID,
-			))
+			service.requests.logRequestProgress(request.ID, hedge.accountLabel, "WARN", "备用请求发起",
+				"primary_waited", time.Since(primary.startedAt), "threshold", plan.delay, "model", modelID)
 		}
 	}
 	return nil
@@ -272,11 +279,11 @@ func (service *trackedService) supersede(requestCtx context.Context, requestID s
 		}
 		if loser.copies != nil {
 			if err := loser.copies.Cleanup(); err != nil {
-				service.requests.log(loser.accountLabel, "WARN", "临时文件清理失败 | 错误="+err.Error())
+				service.requests.log(loser.accountLabel, "WARN", "临时文件清理失败", "error", err)
 			}
 		}
 		if err := loser.lease.Release(); err != nil {
-			service.requests.logRequestProgress(requestID, loser.accountLabel, "WARN", "账户租约释放失败 | 错误="+err.Error())
+			service.requests.logRequestProgress(requestID, loser.accountLabel, "WARN", "账户租约释放失败", "error", err)
 		}
 	}()
 }

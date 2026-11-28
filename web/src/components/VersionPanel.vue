@@ -1,21 +1,44 @@
 <script setup lang="ts">
-import { computed, onActivated, onUnmounted, ref, useTemplateRef, watch } from 'vue'
+import {
+  computed,
+  onActivated,
+  onDeactivated,
+  onMounted,
+  onUnmounted,
+  ref,
+  useTemplateRef,
+  watch,
+} from 'vue'
 import { api } from '@/api'
+import { serverTime, useSecondClock } from '@/elapsed'
 import { useI18n } from '@/i18n'
-import { markdown } from '@/markdown'
-import type { UpdateStatus } from '@/types'
+import type { UpdateProgress, UpdateStatus } from '@/types'
 import UiIcon from '@/components/UiIcon.vue'
 
-const props = defineProps<{ status: UpdateStatus | null; activeRequests: number }>()
+const props = defineProps<{
+  status: UpdateStatus | null
+  activeRequests: number
+  restartStalled: boolean
+}>()
 const emit = defineEmits<{ status: [UpdateStatus]; restarting: [] }>()
 const { t, locale, errorText, logText } = useI18n()
 const checking = ref(false)
 const confirming = ref(false)
 const phase = ref<'idle' | 'installing' | 'restarting'>('idle')
 const error = ref('')
+// progress 是安装期间最近一次读到的更新阶段与下载字节数
+const progress = ref<UpdateProgress | null>(null)
 
 const latest = computed(() => props.status?.latest ?? '')
-const notes = computed(() => markdown.render(props.status?.notes ?? ''))
+// notes 是 GitHub 渲染好的更新说明 HTML，其中的链接在新窗口打开
+const notes = computed(() => {
+  const document = new DOMParser().parseFromString(props.status?.notes ?? '', 'text/html')
+  for (const link of document.querySelectorAll('a')) {
+    link.target = '_blank'
+    link.rel = 'noreferrer'
+  }
+  return document.body.innerHTML
+})
 const notesBox = useTemplateRef<HTMLElement>('notesBox')
 // revealFrame 是放出下一段更新说明的动画帧，没有时为 0
 let revealFrame = 0
@@ -33,7 +56,8 @@ function revealNotes(): void {
   }
   revealFrame = requestAnimationFrame(next)
 }
-watch(notes, revealNotes, { flush: 'post', immediate: true })
+watch(notes, revealNotes, { flush: 'post' })
+onMounted(revealNotes)
 onUnmounted(() => cancelAnimationFrame(revealFrame))
 const publishedAt = computed(() =>
   props.status?.published_at
@@ -44,11 +68,30 @@ const installable = computed(
   () => props.status?.mode === 'binary' && props.status.available && !props.status.updating,
 )
 const summary = computed(() => {
-  if (phase.value === 'installing') return t('version.installing')
-  if (phase.value === 'restarting') return t('version.restarting')
+  if (phase.value === 'installing')
+    return t(progress.value?.stage === 'install' ? 'version.installing' : 'version.downloading')
+  if (phase.value === 'restarting') return props.restartStalled ? '' : t('version.restarting')
   if (props.status?.available) return t('version.available').replace('{version}', latest.value)
-  if (latest.value) return t('version.upToDate')
+  if (latest.value && !props.status?.error) return t('version.upToDate')
   return ''
+})
+// percent 是发行包的下载百分比，总大小未知时为 null
+const percent = computed(() => {
+  const value = progress.value
+  if (!value || value.total <= 0) return null
+  return value.stage === 'download' ? Math.floor((value.downloaded / value.total) * 100) : 100
+})
+// sizeText 是已下载与总大小，按界面语言格式化为 MB
+const sizeText = computed(() => {
+  const value = progress.value
+  if (!value) return ''
+  const format = new Intl.NumberFormat(locale.value, {
+    style: 'unit',
+    unit: 'megabyte',
+    maximumFractionDigits: 1,
+  })
+  const done = format.format(value.downloaded / 1e6)
+  return value.total > 0 ? `${done} / ${format.format(value.total / 1e6)}` : done
 })
 const confirmText = computed(() =>
   t('version.confirmText')
@@ -69,39 +112,97 @@ async function check(refresh: boolean): Promise<void> {
   }
 }
 
-// install 下载并替换为最新版本，成功后通知上层等待重启
+// install 下载并替换为最新版本，期间每 250 ms 读取一次更新进度，成功后通知上层等待重启
 async function install(): Promise<void> {
   confirming.value = false
   phase.value = 'installing'
+  progress.value = null
   error.value = ''
+  const timer = setInterval(() => {
+    api.updateStatus().then((status) => {
+      if (phase.value === 'installing' && status.progress) progress.value = status.progress
+    })
+  }, 250)
   try {
     emit('status', await api.applyUpdate())
   } catch (reason) {
     phase.value = 'idle'
     error.value = errorText(reason)
     return
+  } finally {
+    clearInterval(timer)
   }
   phase.value = 'restarting'
   emit('restarting')
 }
 
-onActivated(() => void check(false))
+// checkMessage 是检查更新失败的原因：限流时为写给用户的说明，其余为服务端给出的原因
+const checkMessage = computed(() =>
+  props.status?.error_kind === 'rate_limited'
+    ? t('version.rateLimited')
+    : logText(props.status?.error ?? ''),
+)
+// retryAt 是服务端预计恢复并重新检查的本机时钟毫秒时刻，没有时为 0
+const retryAt = computed(() =>
+  props.status?.error && props.status.retry_at ? serverTime(props.status.retry_at) : 0,
+)
+const now = useSecondClock(() => retryAt.value > Date.now())
+// retryText 是恢复时刻与剩余分钟数，已过恢复时刻时为空
+const retryText = computed(() => {
+  if (retryAt.value <= now.value) return ''
+  const minutes = Math.ceil((retryAt.value - now.value) / 60_000)
+  return t(minutes <= 1 ? 'version.retryAtSoon' : 'version.retryAt')
+    .replace(
+      '{time}',
+      new Date(retryAt.value).toLocaleTimeString(locale.value, {
+        hour: '2-digit',
+        minute: '2-digit',
+      }),
+    )
+    .replace('{minutes}', String(minutes))
+})
+
+// active 表示版本页正在显示
+let active = false
+let retryTimer = 0
+// scheduleRetry 在版本页显示期间于恢复时刻过后重新检查一次，服务端到时才再次访问 GitHub
+function scheduleRetry(): void {
+  window.clearTimeout(retryTimer)
+  if (!active || retryAt.value === 0) return
+  retryTimer = window.setTimeout(
+    () => phase.value === 'idle' && void check(false),
+    Math.max(retryAt.value - Date.now(), 0) + 1000,
+  )
+}
+watch(retryAt, scheduleRetry)
+
+onActivated(() => {
+  active = true
+  void check(false)
+  scheduleRetry()
+})
+onDeactivated(() => {
+  active = false
+  window.clearTimeout(retryTimer)
+})
 </script>
 
 <template>
   <section
-    class="flex min-h-0 flex-1 flex-col overflow-auto [scrollbar-gutter:stable] md:overflow-hidden"
+    class="flex min-h-0 flex-1 flex-col overflow-auto max-md:[scrollbar-gutter:stable] md:overflow-hidden"
   >
     <header
-      class="flex flex-wrap items-center gap-3 border-b border-line px-4 py-4 md:px-[max(2rem,calc((100%_-_var(--container-4xl))/2_+_2rem))]"
+      class="page-x flex flex-wrap items-center gap-3 border-b border-line py-4 md:overflow-hidden md:[scrollbar-gutter:stable]"
     >
       <div class="min-w-0 flex-1">
         <h2 class="text-xl font-semibold text-white">{{ t('section.version.title') }}</h2>
         <p class="mt-1 text-sm text-gray-500">{{ t('section.version.description') }}</p>
       </div>
     </header>
-    <div class="mx-auto flex min-h-0 w-full max-w-4xl flex-1 flex-col p-4 md:p-8">
-      <article class="shrink-0 rounded-lg border border-line bg-panel p-4 md:p-6">
+    <div
+      class="page-x flex min-h-0 flex-1 flex-col py-4 md:overflow-hidden md:py-8 md:[scrollbar-gutter:stable]"
+    >
+      <article class="shrink-0 rounded-lg border border-line bg-panel p-4">
         <dl class="grid gap-4 sm:grid-cols-2">
           <div>
             <dt class="text-xs text-gray-500">{{ t('version.current') }}</dt>
@@ -124,6 +225,28 @@ onActivated(() => void check(false))
         >
           {{ summary }}
         </p>
+        <div v-if="phase === 'installing'" class="mt-3">
+          <div
+            role="progressbar"
+            :aria-label="summary"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            :aria-valuenow="percent ?? undefined"
+            :aria-valuetext="sizeText || undefined"
+            class="h-1.5 overflow-hidden rounded-full bg-raised"
+          >
+            <div
+              v-if="percent !== null"
+              class="h-full rounded-full bg-blue-500 transition-[width] duration-200 ease-out"
+              :style="{ width: `${percent}%` }"
+            />
+            <div v-else class="update-indeterminate h-full w-1/3 rounded-full bg-blue-500" />
+          </div>
+          <p class="mt-2 flex justify-between font-mono text-xs text-gray-400 tabular-nums">
+            <span>{{ sizeText }}</span>
+            <span v-if="percent !== null">{{ percent }}%</span>
+          </p>
+        </div>
 
         <div class="mt-4 flex flex-wrap items-center gap-2">
           <button
@@ -195,20 +318,33 @@ onActivated(() => void check(false))
           {{ t('version.managed').replaceAll('{name}', status.managed_by ?? '') }}
         </p>
 
+        <div
+          v-if="status?.error"
+          role="status"
+          data-update-check-error
+          class="mt-4 rounded border border-amber-500/40 bg-amber-500/10 p-3 text-sm leading-6 text-amber-200"
+        >
+          <p class="break-words">{{ checkMessage }}</p>
+          <p v-if="retryText">{{ retryText }}</p>
+        </div>
         <p
-          v-if="error || status?.error"
+          v-if="restartStalled || error"
           role="alert"
           class="mt-4 rounded border border-red-500/40 bg-red-500/10 p-3 text-sm break-words text-red-300"
         >
-          {{ error || logText(status?.error ?? '') }}
+          {{
+            restartStalled
+              ? t('version.restartStalled').replace('{path}', status?.log_dir ?? '')
+              : error
+          }}
         </p>
       </article>
 
       <article
         v-if="status?.notes"
-        class="mt-6 flex min-h-0 flex-1 flex-col rounded-lg border border-line bg-panel p-4 md:p-6"
+        class="mt-4 flex min-h-0 flex-1 flex-col rounded-lg border border-line bg-panel p-4"
       >
-        <h3 class="font-bold text-gray-300">
+        <h3 class="text-sm font-semibold text-gray-200">
           {{ t('version.notes').replace('{version}', latest) }}
         </h3>
         <div
@@ -220,3 +356,22 @@ onActivated(() => void check(false))
     </div>
   </section>
 </template>
+
+<style scoped>
+.update-indeterminate {
+  animation: update-indeterminate 1.2s ease-in-out infinite;
+}
+@keyframes update-indeterminate {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(300%);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .update-indeterminate {
+    animation: none;
+  }
+}
+</style>

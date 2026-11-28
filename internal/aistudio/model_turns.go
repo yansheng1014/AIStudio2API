@@ -1,7 +1,14 @@
 package aistudio
 
 import (
+	"bytes"
+	"container/list"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"slices"
+	"strings"
 	"sync"
 )
 
@@ -20,59 +27,71 @@ type modelTurnKey struct {
 	digest string
 }
 
-// modelTurnHistory 按 API key 与对话摘要保存本进程生成的模型轮，客户端回传同一回复时与官网一样带回思考 Part、签名 Part 与轮次令牌
+// modelTurnEntry 是模型回复历史中的一条记录
+type modelTurnEntry struct {
+	key  modelTurnKey
+	turn modelTurn
+}
+
+// modelTurnHistory 按 API key 与对话摘要保存本进程生成的模型轮，order 从最近使用到最久未用排列，客户端回传同一回复时与官网一样带回思考 Part、签名 Part 与轮次令牌
 type modelTurnHistory struct {
 	mu      sync.Mutex
-	entries map[modelTurnKey]modelTurn
-	order   []modelTurnKey
+	entries map[modelTurnKey]*list.Element
+	order   list.List
 }
 
 func newModelTurnHistory() *modelTurnHistory {
-	return &modelTurnHistory{entries: make(map[modelTurnKey]modelTurn)}
+	return &modelTurnHistory{entries: make(map[modelTurnKey]*list.Element)}
 }
 
-// store 保存接在 history 之后生成的模型轮；history 以模型轮结尾、回复带内联媒体或没有思考、签名与轮次令牌时不保存，超过上限时丢弃最早的一条
-func (turns *modelTurnHistory) store(apiKey string, history []Content, turn modelTurn) {
-	if history[len(history)-1].Role == RoleAssistant || slices.ContainsFunc(turn.parts, func(part Part) bool { return part.InlineData != nil }) ||
+// store 保存接在 tip 所在对话之后生成的模型轮；tip 为模型轮、回复带内联媒体或没有思考、签名与轮次令牌时不保存，达到上限时淘汰最久未用的一条
+func (turns *modelTurnHistory) store(apiKey string, tip turnLink, turn modelTurn) {
+	if tip.model || slices.ContainsFunc(turn.parts, func(part Part) bool { return part.InlineData != nil }) ||
 		turn.turnToken == "" && !slices.ContainsFunc(turn.parts, func(part Part) bool { return part.Thought || part.ThoughtSignature != "" }) {
 		return
 	}
-	links := assistantLinks(append(slices.Clone(history), Content{Role: RoleAssistant, Parts: turn.parts}))
-	key := modelTurnKey{apiKey: apiKey, digest: links[len(links)-1].digest}
+	key := modelTurnKey{apiKey: apiKey, digest: turnLinkDigest(tip.digest, true, turn.parts)}
 	turns.mu.Lock()
 	defer turns.mu.Unlock()
-	if _, exists := turns.entries[key]; !exists {
-		turns.order = append(turns.order, key)
+	if element, exists := turns.entries[key]; exists {
+		element.Value = modelTurnEntry{key: key, turn: turn}
+		turns.order.MoveToFront(element)
+		return
 	}
-	turns.entries[key] = turn
-	if len(turns.order) > modelTurnLimit {
-		delete(turns.entries, turns.order[0])
-		turns.order = turns.order[1:]
+	if turns.order.Len() >= modelTurnLimit {
+		oldest := turns.order.Back()
+		delete(turns.entries, oldest.Value.(modelTurnEntry).key)
+		turns.order.Remove(oldest)
 	}
+	turns.entries[key] = turns.order.PushFront(modelTurnEntry{key: key, turn: turn})
 }
 
-// restore 把对话中本进程生成过的模型轮换成生成时的 Part，函数调用沿用客户端回传的 ID，返回改写后的对话与最后一个模型轮的轮次令牌
-func (turns *modelTurnHistory) restore(apiKey string, contents []Content) ([]Content, string) {
+// restore 把对话中本进程生成过的模型轮换成生成时的 Part 并刷新其最近使用顺序，函数调用沿用客户端回传的 ID，返回改写后的对话、最后一个模型轮的轮次令牌与对话最后一组轮次的累积摘要
+func (turns *modelTurnHistory) restore(apiKey string, contents []Content) ([]Content, string, turnLink) {
+	links := turnLinks(contents)
 	turns.mu.Lock()
 	defer turns.mu.Unlock()
 	restored := make([]Content, 0, len(contents))
 	token := ""
 	start := 0
-	for _, link := range assistantLinks(contents) {
-		turn, found := turns.entries[modelTurnKey{apiKey: apiKey, digest: link.digest}]
-		switch {
-		case link.model && found:
-			restored = append(restored, Content{Role: RoleAssistant, Parts: withCallIDs(turn.parts, contents[start:link.end])})
-			token = turn.turnToken
-		case link.model:
-			restored = append(restored, contents[start:link.end]...)
-			token = ""
-		default:
+	var tip turnLink
+	for _, link := range links {
+		if link.model {
+			if element, found := turns.entries[modelTurnKey{apiKey: apiKey, digest: link.digest}]; found {
+				turns.order.MoveToFront(element)
+				turn := element.Value.(modelTurnEntry).turn
+				restored = append(restored, Content{Role: RoleAssistant, Parts: withCallIDs(turn.parts, contents[start:link.end])})
+				token = turn.turnToken
+			} else {
+				restored = append(restored, contents[start:link.end]...)
+				token = ""
+			}
+		} else {
 			restored = append(restored, contents[start:link.end]...)
 		}
-		start = link.end
+		start, tip = link.end, link
 	}
-	return restored, token
+	return restored, token, tip
 }
 
 // withCallIDs 返回 parts 的副本，其中的函数调用依次换成 echoed 中函数调用的 ID
@@ -95,4 +114,181 @@ func withCallIDs(parts []Part, echoed []Content) []Part {
 		restored[index].FunctionCall = &call
 	}
 	return restored
+}
+
+// turnLink 是对话中一组连续的模型轮或其余轮次结束处的累积摘要
+type turnLink struct {
+	end    int
+	model  bool
+	digest string
+}
+
+// turnChain 是一份对话与其末尾一组轮次的累积摘要
+type turnChain struct {
+	contents []Content
+	tip      turnLink
+}
+
+// tipOf 返回 contents 末尾一组轮次的累积摘要：contents 就是 chain 记下的那份对话时直接沿用，否则重新计算
+func (chain turnChain) tipOf(contents []Content) turnLink {
+	if len(contents) > 0 && len(chain.contents) == len(contents) && &chain.contents[0] == &contents[0] {
+		return chain.tip
+	}
+	links := turnLinks(contents)
+	if len(links) == 0 {
+		return turnLink{}
+	}
+	return links[len(links)-1]
+}
+
+// turnLinks 把对话按连续的模型轮与其余轮次分组，返回每组结束处的累积摘要
+func turnLinks(contents []Content) []turnLink {
+	var links []turnLink
+	digest := ""
+	for start := 0; start < len(contents); {
+		model := contents[start].Role == RoleAssistant
+		parts := slices.Clip(contents[start].Parts)
+		end := start + 1
+		for ; end < len(contents) && (contents[end].Role == RoleAssistant) == model; end++ {
+			parts = append(parts, contents[end].Parts...)
+		}
+		digest = turnLinkDigest(digest, model, parts)
+		links = append(links, turnLink{end: end, model: model, digest: digest})
+		start = end
+	}
+	return links
+}
+
+// turnLinkDigest 返回在 previous 之后接上一组轮次的摘要：正文 Part 直接连接后去掉首尾空白，函数调用计入名称与规范参数，函数结果计入规范内容，其余 Part 去掉签名、内联数据以其 SHA-256 计入；思考与调用 ID 不计入，客户端回传的模型轮与服务输出的同一回复得到同一摘要
+func turnLinkDigest(previous string, model bool, parts []Part) string {
+	key, cacheable := turnDigestKey(previous, model, parts)
+	if cacheable {
+		if digest, ok := turnDigests.get(key); ok {
+			return digest
+		}
+	}
+	digest := computeTurnLinkDigest(previous, model, parts)
+	if cacheable {
+		turnDigests.put(key, digest)
+	}
+	return digest
+}
+
+// computeTurnLinkDigest 不经缓存计算 turnLinkDigest 的摘要
+func computeTurnLinkDigest(previous string, model bool, parts []Part) string {
+	var text []string
+	items := []any{}
+	for _, part := range parts {
+		switch {
+		case part.Thought:
+		case part.FunctionCall != nil:
+			items = append(items, []any{part.FunctionCall.Name, canonicalJSON(part.FunctionCall.Arguments)})
+		case part.FunctionResult != nil:
+			items = append(items, []any{canonicalJSON(part.FunctionResult.Content)})
+		case part.Text != "":
+			text = append(text, part.Text)
+		case !part.payload():
+		default:
+			part.ThoughtSignature = ""
+			if part.InlineData != nil {
+				sum := part.InlineData.SHA256()
+				part.InlineData = &Blob{MIME: part.InlineData.MIME, Data: sum[:]}
+			}
+			items = append(items, part)
+		}
+	}
+	encoded, _ := json.Marshal([]any{previous, model, strings.TrimSpace(strings.Join(text, "")), items})
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
+}
+
+// turnDigestLimit 是本进程缓存的轮次摘要条数上限
+const turnDigestLimit = 4096
+
+// turnDigestCache 是轮次摘要缓存，键为前序摘要与轮次原始内容的 SHA-256，超过上限时丢弃最早的一条
+type turnDigestCache struct {
+	mu      sync.Mutex
+	entries map[[sha256.Size]byte]string
+	order   [][sha256.Size]byte
+}
+
+// turnDigests 是本进程的轮次摘要缓存，同一对话的后续请求与同一请求的多次计算沿用已算出的摘要
+var turnDigests = &turnDigestCache{entries: make(map[[sha256.Size]byte]string)}
+
+// get 返回缓存中键对应的摘要
+func (cache *turnDigestCache) get(key [sha256.Size]byte) (string, bool) {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	digest, ok := cache.entries[key]
+	return digest, ok
+}
+
+// put 保存键对应的摘要，超过上限时丢弃最早的一条
+func (cache *turnDigestCache) put(key [sha256.Size]byte, digest string) {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if _, exists := cache.entries[key]; exists {
+		return
+	}
+	cache.entries[key] = digest
+	cache.order = append(cache.order, key)
+	if len(cache.order) > turnDigestLimit {
+		delete(cache.entries, cache.order[0])
+		cache.order = cache.order[1:]
+	}
+}
+
+// turnDigestKey 返回轮次摘要的缓存键：前序摘要、角色与按 turnLinkDigest 计入的正文、函数调用与函数结果原文；含其余 Part 的轮次不缓存
+func turnDigestKey(previous string, model bool, parts []Part) ([sha256.Size]byte, bool) {
+	hash := sha256.New()
+	var chunk [4096]byte
+	header := func(kind byte, size int) {
+		chunk[0] = kind
+		binary.LittleEndian.PutUint64(chunk[1:9], uint64(size))
+		hash.Write(chunk[:9])
+	}
+	write := func(kind byte, value []byte) {
+		header(kind, len(value))
+		hash.Write(value)
+	}
+	writeString := func(kind byte, value string) {
+		header(kind, len(value))
+		for len(value) > 0 {
+			count := copy(chunk[:], value)
+			hash.Write(chunk[:count])
+			value = value[count:]
+		}
+	}
+	writeString('p', previous)
+	if model {
+		header('m', 0)
+	}
+	for _, part := range parts {
+		switch {
+		case part.Thought:
+		case part.FunctionCall != nil:
+			writeString('c', part.FunctionCall.Name)
+			write('a', part.FunctionCall.Arguments)
+		case part.FunctionResult != nil:
+			write('r', part.FunctionResult.Content)
+		case part.Text != "":
+			writeString('t', part.Text)
+		case !part.payload():
+		default:
+			return [sha256.Size]byte{}, false
+		}
+	}
+	return [sha256.Size]byte(hash.Sum(nil)), true
+}
+
+// canonicalJSON 返回键按字典序排列、不含空白的 JSON，不是 JSON 时返回去掉首尾空白的原文
+func canonicalJSON(raw json.RawMessage) string {
+	var value any
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if decoder.Decode(&value) != nil {
+		return strings.TrimSpace(string(raw))
+	}
+	encoded, _ := json.Marshal(value)
+	return string(encoded)
 }

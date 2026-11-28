@@ -3,10 +3,12 @@ import {
   effectScope,
   hasInjectionContext,
   inject,
+  markRaw,
   provide,
   reactive,
   ref,
   shallowReactive,
+  toRaw,
   watch,
   type InjectionKey,
 } from 'vue'
@@ -14,7 +16,17 @@ import { api, ApiError } from '@/api'
 import { useConsole } from '@/console'
 import { keepPage } from '@/desktop'
 import { useI18n } from '@/i18n'
-import type { Model, SavedPrompt, SystemInstructionPreset } from '@/types'
+import type { Model, PromptInput, SavedPrompt, SystemInstructionPreset } from '@/types'
+import {
+  copyAttachmentBlob,
+  hasCachedAttachmentBlob,
+  hasSameAttachmentBlob,
+  loadAttachmentBlob,
+  localAttachment,
+  revokeAttachmentURL,
+  revokeTurnURLs,
+  uploadAttachment,
+} from './attachment'
 import {
   agentTools,
   Capability,
@@ -26,17 +38,21 @@ import {
   toolCompatible,
   type Tool,
 } from './catalog'
-import { readImage } from './media/api'
+import { countVideoFrames, driveFileExists, uploadDriveFile } from './drive'
 import { generate, protocolsFor } from './protocols'
 import {
-  agentConfig,
+  agentFields,
   apiKey,
   apiPart,
   appendParts,
   buildRequest,
   continuation,
   countTokens,
+  countTokensDetailed,
   failureText,
+  hydratePart,
+  hydrateRequestTurns,
+  type TokenCountResult,
 } from './request'
 import type {
   CompareData,
@@ -67,13 +83,6 @@ export const safetyThresholds: SafetyThreshold[] = [
   'BLOCK_MEDIUM_AND_ABOVE',
   'BLOCK_LOW_AND_ABOVE',
 ]
-
-// outputLimit 返回模型输出长度上限，自动续写模型为输入上限
-export function outputLimit(model: Model | undefined): number | undefined {
-  return model?.capabilities?.output_continuation
-    ? model.input_token_limit
-    : model?.output_token_limit
-}
 
 // researchDefaults 是 Deep Research 的思考摘要、可视化与协作规划默认值，与官网一样取模型目录 field 82 默认开启的能力码
 function researchDefaults(model: Model | undefined) {
@@ -144,6 +153,7 @@ export function defaultSettings(model: Model | undefined): RunSettings {
     imageQuality: 'auto',
     agentModel: '',
     maxTotalTokens: null,
+    environment: { type: 'new', id: '', sources: [], rules: [] },
     ...researchDefaults(undefined),
     ...modelDefaults(model),
   }
@@ -161,9 +171,106 @@ export function newTurnID(): string {
 // SaveState 是对话保存状态
 type SaveState = 'idle' | 'saving' | 'saved' | 'error'
 
-// cloneData 以 JSON 往返复制对话数据，嵌套的响应式对象一并复制为普通对象
+// uploadedVideo 表示片段是附件加入时已上传 Drive 的视频，与官网一样以抽帧统计 token 数
+function uploadedVideo(part: Part): boolean {
+  return part.fileData !== undefined && part.inlineData?.mimeType.startsWith('video/') === true
+}
+
+// renewUploads 在发送前并行检查各视频的 Files API 上传文件，已到期或已不存在的按顺序以原视频重新上传；signal 中止时检查与上传随之中止
+async function renewUploads(
+  turns: readonly Turn[],
+  signal: AbortSignal | null = null,
+): Promise<void> {
+  const videos = turns.flatMap((turn) => turn.parts).filter(uploadedVideo)
+  const missing = (
+    await Promise.all(
+      videos.map(async (part) =>
+        Date.now() < part.fileExpires! && (await driveFileExists(part.fileData!.fileUri, signal))
+          ? null
+          : part,
+      ),
+    )
+  ).filter((part): part is Part => part !== null)
+  for (const part of missing) {
+    const uploaded = await uploadDriveFile(
+      await loadAttachmentBlob(part, signal),
+      part.fileName!,
+      signal,
+    )
+    part.fileData = { mimeType: uploaded.mimeType, fileUri: uploaded.uri }
+    part.fileExpires = Date.parse(uploaded.expirationTime)
+  }
+}
+
+// persistLocalMedia 把尚未落盘的本地 Blob 与内联 Base64 媒体上传到对话媒体库并写入 mediaId
+async function persistLocalMedia(turns: readonly Turn[], live?: readonly Turn[]): Promise<void> {
+  for (let ti = 0; ti < turns.length; ti++) {
+    const turn = turns[ti]!
+    const liveTurn = live?.[ti]?.id === turn.id ? live[ti] : undefined
+    for (let pi = 0; pi < turn.parts.length; pi++) {
+      const part = turn.parts[pi]!
+      const inline = part.inlineData
+      if (!inline || inline.mediaId || (inline.data === '' && !hasCachedAttachmentBlob(inline)))
+        continue
+      const blob = await loadAttachmentBlob(part)
+      const mediaId = await api.uploadPromptMedia(blob, inline.mimeType)
+      revokeAttachmentURL(part)
+      const persisted = markRaw({
+        mimeType: inline.mimeType,
+        data: '',
+        mediaId,
+        ...(inline.displayName !== undefined && { displayName: inline.displayName }),
+      })
+      part.inlineData = persisted
+      const livePart = liveTurn?.parts[pi]
+      if (
+        livePart?.inlineData &&
+        !livePart.inlineData.mediaId &&
+        (hasSameAttachmentBlob(livePart.inlineData, blob) ||
+          (inline.data !== '' && livePart.inlineData.data === inline.data))
+      ) {
+        revokeAttachmentURL(livePart)
+        livePart.inlineData = persisted
+      }
+    }
+  }
+}
+
+// rawInlineMarks 把对话轮次中的内联媒体标记为非响应式对象
+function rawInlineMarks(turns: Turn[]): Turn[] {
+  for (const turn of turns) {
+    for (const part of turn.parts) {
+      if (part.inlineData) part.inlineData = markRaw(toRaw(part.inlineData))
+    }
+  }
+  return turns
+}
+
+// framedVideo 表示片段是已按抽帧统计过 token 数的视频
+function framedVideo(part: Part): boolean {
+  return uploadedVideo(part) && part.tokenCount !== undefined
+}
+
+// attachmentCounts 记录每个附件最近一次 token 计数请求，只接收最近一次请求的结果
+const attachmentCounts = new WeakMap<Part, object>()
+
+// cloneData 复制对话数据为普通对象，内联附件复用原 Base64 字符串与缓存的 Blob
 function cloneData<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T
+  const raw = toRaw(value)
+  if (raw === null || typeof raw !== 'object') return raw
+  if (Array.isArray(raw)) return raw.map((item) => cloneData(item)) as T
+  const copy: Record<string, unknown> = {}
+  for (const [key, item] of Object.entries(raw as Record<string, unknown>)) {
+    if (key === 'inlineData' && item !== null && typeof item === 'object') {
+      const source = toRaw(item) as NonNullable<Part['inlineData']>
+      const target = markRaw({ ...source })
+      copyAttachmentBlob(source, target)
+      copy[key] = target
+    } else {
+      copy[key] = cloneData(item)
+    }
+  }
+  return copy as T
 }
 
 // models 返回实时模型目录
@@ -171,20 +278,25 @@ function models(): Model[] {
   return useConsole().models.value
 }
 
-// SessionLinks 是对话实例与页面其他窗格的关联：compare 返回随对话一起保存的右侧窗格，save 是右侧窗格变化时保存页面对话的函数
+// SessionLinks 是对话实例与页面其他窗格的关联：compare 返回随对话一起保存的右侧窗格，save 是右侧窗格变化时保存页面对话的函数，draft 返回对比模式共用的输入框文本与附件
 interface SessionLinks {
   compare?: () => CompareData | undefined
   save?: () => Promise<void>
+  canSave?: () => boolean
+  draft?: () => { text: string; attachments: Part[] }
 }
 
+// draftCountDelay 与官网一致：输入框停止输入 500 ms 后才统计输入框文本的 token
+const draftCountDelay = 500
+
 // createSession 创建一个对话实例，temporary 为真时不单独写入对话库
-function createSession(temporary = false, links: SessionLinks = {}) {
+function createSession(temporary = false, links: SessionLinks = {}, initial?: PaneData) {
   const session = reactive({
     id: null as string | null,
     title: '',
     description: '',
-    settings: defaultSettings(undefined),
-    turns: [] as Turn[],
+    settings: initial ? cloneData(initial.settings) : defaultSettings(undefined),
+    turns: initial ? cloneData(initial.turns) : ([] as Turn[]),
     draft: '',
     attachments: [] as Part[],
     running: false,
@@ -192,6 +304,8 @@ function createSession(temporary = false, links: SessionLinks = {}) {
     temporary,
     rawMode: false,
     promptTokens: null as number | null,
+    draftTokens: 0,
+    systemTokens: null as number | null,
     saveState: 'idle' as SaveState,
     loadError: '',
     loading: false,
@@ -202,6 +316,21 @@ function createSession(temporary = false, links: SessionLinks = {}) {
   // opened 是 open 装入的运行设置，换入它引起的设置变化不触发保存
   let opened: RunSettings | undefined
   let tokenController: AbortController | undefined
+  // writing 是正在执行的写入请求，pendingSaves 按对话 ID 合并排队中的最新快照，persistedIds 记录已落盘到服务端的对话 ID
+  let writing: Promise<unknown> = Promise.resolve()
+  let draining = false
+  let savingId: string | null = null
+  const pendingSaves = new Map<string, PromptInput<PromptData>>()
+  const persistedIds = new Set<string>()
+  // staleTokens 表示最近一次保存写入时对话的 token 统计尚未返回，统计返回后再保存一次
+  let staleTokens = false
+  let draftController: AbortController | undefined
+  let draftTimer = 0
+  let tokenTimer = 0
+  // opening 是对话读取的序号，每次丢弃读取时递增，读取返回时序号已变则丢弃结果
+  let opening = 0
+  // lastRun 是对话末尾模型轮次那次运行的输入与输出 token 数，取自生成用量或整段统计的逐轮明细
+  const lastRun = ref<{ id: string; input: number; output: number } | null>(null)
   const scope = effectScope(true)
 
   // currentModel 返回当前所选模型
@@ -209,9 +338,34 @@ function createSession(temporary = false, links: SessionLinks = {}) {
     computed(() => models().find((model) => model.id === session.settings.model)),
   )!
 
+  // draftSource 返回本窗格使用的输入框文本与附件，对比模式的右侧窗格共用主输入框
+  const draftSource = () =>
+    links.draft ? links.draft() : { text: session.draft, attachments: session.attachments }
+
+  // usage 是标题栏显示的 token 用量：总数为对话、输入框文本与输入框附件之和；输入框为空且末尾是模型轮次时，输入与输出取那次运行，否则全部记为下一次运行的输入
+  const usage = scope.run(() =>
+    computed(() => {
+      const pending =
+        session.draftTokens +
+        draftSource().attachments.reduce((sum, part) => sum + (part.tokenCount ?? 0), 0)
+      const total = (session.promptTokens ?? 0) + pending
+      const last = session.turns.at(-1)
+      const run =
+        pending === 0 && last !== undefined && lastRun.value?.id === last.id ? lastRun.value : null
+      return {
+        total,
+        input: run ? run.input : total,
+        output: run ? run.output : 0,
+        cached: run ? (last?.cachedTokens ?? 0) : 0,
+      }
+    }),
+  )!
+
   // newChat 丢弃尚未写入的保存与生成，开始一个空白对话，systemInstruction 为新对话的系统指令
   function newChat(systemInstruction = ''): void {
     discard()
+    revokeTurnURLs(session.turns)
+    for (const part of session.attachments) revokeAttachmentURL(part)
     Object.assign(session, {
       id: null,
       title: '',
@@ -222,10 +376,14 @@ function createSession(temporary = false, links: SessionLinks = {}) {
       attachments: [],
       running: false,
       promptTokens: null,
+      draftTokens: 0,
+      systemTokens: null,
       saveState: 'idle',
       loadError: '',
       rawMode: false,
     })
+    lastRun.value = null
+    if (systemInstruction.trim() !== '') scheduleTokens()
   }
 
   // ensureModel 在目录到达后为没有模型的对话补上默认模型
@@ -251,42 +409,68 @@ function createSession(temporary = false, links: SessionLinks = {}) {
       session.settings.protocol = protocols[0]!.value
   }
 
-  // open 读取对话库中的对话并返回其内容，loaded 为已读取的内容，读取失败时换成空白对话并记录原因，返回 undefined
+  // open 读取对话库中的对话并返回其内容，loaded 为已读取的内容，replacing 在读取完成且仍是最新选择、换掉当前对话之前调用，读取失败时换成空白对话并记录原因，返回 undefined；已显示该对话或读取期间又切换了对话时返回 undefined
   async function open(
     id: string,
     loaded?: SavedPrompt<PromptData>,
+    replacing?: () => void,
   ): Promise<SavedPrompt<PromptData> | undefined> {
-    if (session.id === id) return undefined
+    if (session.id === id) {
+      cancelOpen()
+      return undefined
+    }
     discard()
+    const current = opening
     session.loading = true
     session.loadError = ''
     try {
       const prompt = loaded ?? (await api.prompt<PromptData>(id))
+      if (current !== opening) return undefined
+      replacing?.()
+      if (!Array.isArray(prompt.data?.turns)) {
+        newChat()
+        session.loadError = 'not_chat'
+        return undefined
+      }
+      revokeTurnURLs(session.turns)
+      for (const part of session.attachments) revokeAttachmentURL(part)
       Object.assign(session, {
         id,
         title: prompt.title,
         description: prompt.description,
         settings: { ...defaultSettings(undefined), ...prompt.data.settings },
-        turns: prompt.data.turns,
+        turns: rawInlineMarks(prompt.data.turns),
         draft: '',
         attachments: [],
         running: false,
         temporary: false,
         promptTokens: null,
+        draftTokens: 0,
+        systemTokens: null,
         saveState: 'saved',
       })
+      lastRun.value = null
       opened = session.settings
+      persistedIds.add(id)
       // 打开对话后在下一个任务统计 token，构造整段对话的请求不并入渲染对话的任务
-      setTimeout(() => void refreshTokens())
+      scheduleTokens()
       return prompt
     } catch (error) {
+      if (current !== opening) return undefined
+      replacing?.()
       newChat()
       session.loadError =
         error instanceof ApiError && error.status === 404 ? 'not_found' : useI18n().errorText(error)
       return undefined
     } finally {
-      session.loading = false
+      if (current === opening) session.loading = false
     }
+  }
+
+  // cancelOpen 丢弃进行中的对话读取，读取结果返回后不再写入对话
+  function cancelOpen(): void {
+    opening++
+    session.loading = false
   }
 
   // promptTitle 以首条用户输入的第一行作为对话标题
@@ -300,8 +484,15 @@ function createSession(temporary = false, links: SessionLinks = {}) {
     return text.length > 60 ? `${text.slice(0, 60)}…` : text
   }
 
-  // save 把调用时的对话连同对比模式的右侧窗格写入对话库，右侧窗格保存所在的页面对话，其他临时对话不保存；保存状态只回写到仍在显示的同一对话
+  // clearSave 取消尚未到时的合并保存
+  function clearSave(): void {
+    window.clearTimeout(saveTimer.value)
+    saveTimer.value = 0
+  }
+
+  // save 把调用时的对话连同对比模式的右侧窗格写入对话库，右侧窗格保存所在的页面对话，其他临时对话不保存；写入排在之前的保存之后，保存状态只由最后一次保存回写到仍在显示的同一对话
   async function save(): Promise<void> {
+    clearSave()
     if (links.save) return links.save()
     if (
       session.temporary ||
@@ -310,27 +501,74 @@ function createSession(temporary = false, links: SessionLinks = {}) {
         session.settings.systemInstruction.trim() === '')
     )
       return
-    const compare = links.compare?.()
     session.id ??= newTurnID()
     const id = session.id
-    session.saveState = 'saving'
-    try {
-      await api.savePrompt<PromptData>(id, {
-        title: session.title,
-        model: session.settings.model,
-        description: session.description,
-        data: { settings: session.settings, turns: session.turns, ...(compare && { compare }) },
-      })
-      if (session.id === id) session.saveState = 'saved'
-    } catch {
-      if (session.id === id) session.saveState = 'error'
+    const compare = links.compare?.()
+    const prompt: PromptInput<PromptData> = {
+      title: session.title,
+      model: session.settings.model,
+      description: session.description,
+      turns: session.turns.length,
+      ...(session.promptTokens !== null && { tokens: session.promptTokens }),
+      data: cloneData({
+        settings: session.settings,
+        turns: session.turns,
+        ...(compare && { compare }),
+      }),
     }
+    staleTokens = tokenTimer !== 0 || tokenController !== undefined
+    pendingSaves.set(id, prompt)
+    session.saveState = 'saving'
+    if (draining) {
+      await writing
+      return
+    }
+    draining = true
+    writing = (async () => {
+      try {
+        while (pendingSaves.size > 0) {
+          const entry = pendingSaves.entries().next().value
+          if (!entry) break
+          const [nextId, nextPrompt] = entry
+          pendingSaves.delete(nextId)
+          savingId = nextId
+          try {
+            const live = session.id === nextId
+            await persistLocalMedia(nextPrompt.data.turns, live ? session.turns : undefined)
+            if (nextPrompt.data.compare)
+              await persistLocalMedia(
+                nextPrompt.data.compare.turns,
+                live ? links.compare?.()?.turns : undefined,
+              )
+            await api.savePrompt<PromptData>(nextId, nextPrompt)
+            persistedIds.add(nextId)
+            if (!pendingSaves.has(nextId) && session.id === nextId) session.saveState = 'saved'
+          } catch {
+            if (!pendingSaves.has(nextId) && session.id === nextId) session.saveState = 'error'
+          } finally {
+            savingId = null
+          }
+        }
+      } finally {
+        draining = false
+      }
+    })()
+    await writing
+  }
+
+  // cancelSave 丢弃指定对话尚未发出的保存并等待该对话在途写入结束，返回该对话是否已在服务端存在
+  async function cancelSave(id: string): Promise<boolean> {
+    pendingSaves.delete(id)
+    if (savingId === id) await writing
+    const existed = persistedIds.has(id)
+    persistedIds.delete(id)
+    return existed
   }
 
   // scheduleSave 在对话变化后合并保存，生成中到时的保存由生成结束时的保存代替
   function scheduleSave(): void {
     if (session.saveState === 'saved') session.saveState = 'idle'
-    window.clearTimeout(saveTimer.value)
+    clearSave()
     saveTimer.value = window.setTimeout(() => {
       saveTimer.value = 0
       if (!session.running) void save()
@@ -342,47 +580,154 @@ function createSession(temporary = false, links: SessionLinks = {}) {
     return saveTimer.value !== 0 || session.running
   }
 
-  // discard 撤销尚未到时的合并保存并中止生成
+  // discard 撤销尚未到时的合并保存、尚未到时与进行中的 token 统计和统计返回后的保存，丢弃进行中的对话读取，并中止生成
   function discard(): void {
-    window.clearTimeout(saveTimer.value)
-    saveTimer.value = 0
+    cancelOpen()
+    clearSave()
+    staleTokens = false
+    window.clearTimeout(tokenTimer)
+    window.clearTimeout(draftTimer)
+    tokenTimer = draftTimer = 0
+    tokenController?.abort()
+    draftController?.abort()
+    tokenController = draftController = undefined
     controller?.abort()
   }
 
-  // refreshTokens 用 countTokens 统计当前对话的输入 token
-  async function refreshTokens(): Promise<void> {
+  // hasSystemInput 表示当前模型支持系统指令且系统指令不为空
+  function hasSystemInput(): boolean {
+    return (
+      session.settings.systemInstruction.trim() !== '' &&
+      hasCode(currentModel.value, Capability.SystemInstruction)
+    )
+  }
+
+  // countPrompt 与官网一致统计若干轮次与系统指令的输入 token：已按抽帧计数的视频取其 token 数，其余内容用 countTokens 统计，turns 为实际统计的轮次
+  async function countPrompt(
+    model: Model,
+    source: Turn[],
+    hasSystem: boolean,
+    signal: AbortSignal,
+  ) {
+    const framed = source.flatMap((turn) => turn.parts.filter(framedVideo))
+    const turns = source
+      .map((turn) => ({ ...turn, parts: turn.parts.filter((part) => !framedVideo(part)) }))
+      .filter((turn) => turn.parts.length > 0)
+    const counted: TokenCountResult =
+      turns.length === 0 && !hasSystem
+        ? { totalTokens: 0 }
+        : await countTokensDetailed(
+            model.id,
+            apiKey(),
+            buildRequest(session.settings, model, await hydrateRequestTurns(turns, signal)),
+            signal,
+          )
+    const count = framed.reduce((sum, part) => sum + part.tokenCount!, counted.totalTokens)
+    return { count, counted, turns }
+  }
+
+  // refreshTokens 统计当前对话与系统指令的输入 token，系统指令与末尾模型轮次的 token 取统计的逐轮明细；统计返回前有保存写入时，返回后再保存一次
+  async function refreshTokens(prehydrated?: Turn[]): Promise<void> {
+    window.clearTimeout(tokenTimer)
+    tokenTimer = 0
     tokenController?.abort()
+    tokenController = undefined
     const model = currentModel.value
-    if (model === undefined || session.turns.length === 0) {
+    const hasSystem = hasSystemInput()
+    if (!hasSystem) session.systemTokens = null
+    if (model === undefined || (session.turns.length === 0 && !hasSystem)) {
       session.promptTokens = null
       return
     }
     const counter = new AbortController()
     tokenController = counter
     try {
-      const count = await countTokens(
-        model.id,
-        apiKey(),
-        buildRequest(session.settings, model, session.turns),
+      const { count, counted, turns } = await countPrompt(
+        model,
+        prehydrated ?? session.turns,
+        hasSystem,
         counter.signal,
       )
-      if (!counter.signal.aborted) session.promptTokens = count
+      if (tokenController !== counter) return
+      tokenController = undefined
+      session.promptTokens = count
+      session.systemTokens = hasSystem ? (counted.systemTokens ?? null) : null
+      const last = session.turns.at(-1)
+      // tail 是末尾模型轮次正文的 token 数，CountTokens 不给逐轮明细时取该轮生成用量中思考以外的部分
+      const tail =
+        counted.contentTokens?.at(-1) ??
+        (last?.tokens === undefined ? undefined : last.tokens - (last.thoughtTokens ?? 0))
+      if (last?.role === 'model' && turns.at(-1)?.id === last.id && tail !== undefined)
+        lastRun.value = { id: last.id, input: count - tail, output: last.tokens ?? tail }
+      else if (last?.role !== 'model') lastRun.value = null
+      if (staleTokens) scheduleSave()
     } catch {
       // 统计失败时保留上一次的数字
+      if (tokenController === counter) tokenController = undefined
     }
   }
 
-  // countAttachment 与官网一致：附件加入时单独统计它的 token 数，写入片段的 tokenCount
+  // scheduleTokens 在 delay 毫秒后重新统计对话与系统指令，到时前的多次调用合并为一次
+  function scheduleTokens(delay = 0): void {
+    window.clearTimeout(tokenTimer)
+    tokenTimer = window.setTimeout(() => {
+      tokenTimer = 0
+      if (!session.running) void refreshTokens()
+    }, delay)
+  }
+
+  // scheduleDraftTokens 与官网一致：输入框文本停止变化 500 ms 后只统计输入框文本，文本清空时立即归零
+  function scheduleDraftTokens(): void {
+    window.clearTimeout(draftTimer)
+    draftTimer = 0
+    draftController?.abort()
+    draftController = undefined
+    const text = draftSource().text
+    const model = currentModel.value
+    if (text.trim() === '' || model === undefined) {
+      session.draftTokens = 0
+      return
+    }
+    draftTimer = window.setTimeout(async () => {
+      draftTimer = 0
+      const counter = new AbortController()
+      draftController = counter
+      try {
+        const count = await countTokens(
+          model.id,
+          apiKey(),
+          { contents: [{ role: 'user', parts: [{ text }] }], generationConfig: {} },
+          counter.signal,
+        )
+        if (draftController === counter) session.draftTokens = count
+      } catch {
+        // 统计失败时保留上一次的数字
+      }
+    }, draftCountDelay)
+  }
+
+  // countAttachment 与官网一致：附件加入时单独统计它的 token 数，写入片段的 tokenCount；已上传 Drive 的视频按视频设置抽帧计数
   async function countAttachment(part: Part): Promise<void> {
     const model = currentModel.value
     if (model === undefined) return
+    const request = {}
+    attachmentCounts.set(toRaw(part), request)
     try {
-      part.tokenCount = await countTokens(
-        model.id,
-        apiKey(),
-        { contents: [{ role: 'user', parts: [apiPart(part)] }], generationConfig: {} },
-        new AbortController().signal,
-      )
+      if (uploadedVideo(part)) {
+        await renewUploads([{ id: '', role: 'user', parts: [part], created: 0 }])
+      }
+      const count = uploadedVideo(part)
+        ? await countVideoFrames(model.id, part.fileData!.fileUri, part.videoMetadata)
+        : await countTokens(
+            model.id,
+            apiKey(),
+            {
+              contents: [{ role: 'user', parts: [apiPart(await hydratePart(part))] }],
+              generationConfig: {},
+            },
+            new AbortController().signal,
+          )
+      if (attachmentCounts.get(toRaw(part)) === request) part.tokenCount = count
     } catch {
       // 统计失败时附件不显示 token 数
     }
@@ -412,8 +757,8 @@ function createSession(temporary = false, links: SessionLinks = {}) {
     const model = currentModel.value
     if (model === undefined || session.running) return
     const input = continuation(session.settings.protocol, session.turns)
-    const request = buildRequest(session.settings, model, input.turns)
-    void refreshTokens()
+    // sent 是本次发送的轮次，不含随后加入的模型轮次
+    const sent = [...input.turns]
     const turn = reactive<Turn>({
       id: newTurnID(),
       role: 'model',
@@ -426,23 +771,33 @@ function createSession(temporary = false, links: SessionLinks = {}) {
     owner.push(turn)
     session.running = true
     session.started = performance.now()
-    controller = new AbortController()
-    const signal = controller.signal
-    if (session.id === null && !session.temporary) await save()
+    const active = new AbortController()
+    controller = active
+    const signal = active.signal
+    if (session.id === null && !session.temporary) void save()
     try {
+      const lastUser =
+        session.settings.protocol === 'openai-images'
+          ? [...sent].reverse().find((item) => item.role === 'user')
+          : undefined
+      const toSend = lastUser ? [lastUser] : sent
+      await renewUploads(toSend, signal)
+      const hydrated = await hydrateRequestTurns(toSend, signal)
+      if (controller !== active || signal.aborted || session.turns !== owner) return
+      void refreshTokens(input.previous === undefined && !lastUser ? hydrated : undefined)
       await generate({
         protocol: session.settings.protocol,
         stream: session.settings.stream,
         model,
         modelID: model.id,
         apiKey: apiKey(),
-        request,
+        request: buildRequest(session.settings, model, hydrated),
         images: {
           count: session.settings.imageCount,
           size: session.settings.openAISize,
           quality: session.settings.imageQuality,
         },
-        agent: agentConfig(session.settings, model),
+        agent: agentFields(session.settings, model),
         previous: input.previous,
         signal,
         onUpdate: (update) => {
@@ -458,12 +813,21 @@ function createSession(temporary = false, links: SessionLinks = {}) {
             turn.thinking = elapsed
           appendParts(turn.parts, update.parts)
           if (update.interactionId) turn.interactionId = update.interactionId
+          if (update.environmentId)
+            Object.assign(session.settings.environment, {
+              type: 'existing',
+              id: update.environmentId,
+              produced: update.environmentId,
+            })
           if (update.finishReason) turn.finishReason = update.finishReason
           if (update.tokens !== undefined) turn.tokens = update.tokens
           if (update.thoughtTokens !== undefined) turn.thoughtTokens = update.thoughtTokens
+          if (update.cachedTokens !== undefined) turn.cachedTokens = update.cachedTokens
           if (update.promptTokens !== undefined) {
             tokenController?.abort()
+            tokenController = undefined
             session.promptTokens = update.promptTokens + (turn.tokens ?? 0)
+            lastRun.value = { id: turn.id, input: update.promptTokens, output: turn.tokens ?? 0 }
           }
           if (update.sources) turn.sources = update.sources
           if (update.supports) turn.supports = update.supports
@@ -479,8 +843,6 @@ function createSession(temporary = false, links: SessionLinks = {}) {
       turn.duration = Math.round(performance.now() - session.started)
       if (turn.thinking === undefined && turn.parts.some((part) => part.thought))
         turn.thinking = turn.duration
-      session.running = false
-      controller = undefined
       const index = session.turns.indexOf(turn)
       if (
         index !== -1 &&
@@ -489,9 +851,19 @@ function createSession(temporary = false, links: SessionLinks = {}) {
         turn.finishReason === undefined
       )
         session.turns.splice(index, 1)
+      if (controller === active) {
+        session.running = false
+        controller = undefined
+      }
       if (!links.save && session.title === '' && session.turns.includes(turn))
         void generateTitle(model.id)
-      if (session.turns === owner) scheduleSave()
+      if (session.turns === owner) {
+        const hasPendingMedia =
+          (!session.temporary || Boolean(links.canSave?.())) &&
+          turn.parts.some((part) => part.inlineData && !part.inlineData.mediaId)
+        if (hasPendingMedia) void save()
+        else scheduleSave()
+      }
     }
   }
 
@@ -514,15 +886,17 @@ function createSession(temporary = false, links: SessionLinks = {}) {
     scheduleSave()
   }
 
-  // stop 中止当前生成
+  // stop 中止当前生成与关联的输入 token 统计
   function stop(): void {
     controller?.abort()
+    tokenController?.abort()
+    tokenController = undefined
   }
 
   // rerun 从某一轮重新生成：模型轮次替换自身，用户轮次替换其后的回复
   function rerun(index: number): void {
     if (session.running) return
-    session.turns.splice(session.turns[index]!.role === 'model' ? index : index + 1)
+    revokeTurnURLs(session.turns.splice(session.turns[index]!.role === 'model' ? index : index + 1))
     void run()
   }
 
@@ -549,45 +923,74 @@ function createSession(temporary = false, links: SessionLinks = {}) {
     void run()
   }
 
-  // forgetInteractions 去掉从 index 起各模型轮的交互 ID：这些交互的上游上下文含有被修改的轮次，之后不从它们续接
+  // forgetInteractions 去掉从 index 起各模型轮的交互 ID 与缓存命中数：这些交互的上游上下文含有被修改的轮次，之后不从它们续接
   function forgetInteractions(index: number): void {
-    for (const turn of session.turns.slice(index)) delete turn.interactionId
+    for (const turn of session.turns.slice(index)) {
+      delete turn.interactionId
+      delete turn.cachedTokens
+    }
   }
 
-  // editTurn 用新文本替换某一轮的文本片段，文本有变化时其后的交互不再用于续接
+  // editTurn 用新文本替换某一轮的正文：新文本放在首个正文片段的位置，其他片段保持原有顺序；文本有变化时其后的交互不再用于续接，模型轮次的生成用量失效，重新统计 token
   function editTurn(index: number, text: string): void {
     const turn = session.turns[index]!
-    const others = turn.parts.filter((part) => part.text === undefined || part.thought)
+    const body = (part: Part) => part.text !== undefined && !part.thought
     const current = turn.parts
-      .filter((part) => part.text !== undefined && !part.thought)
+      .filter(body)
       .map((part) => part.text)
       .join('')
-    if (text !== current) forgetInteractions(index)
-    turn.parts = text === '' ? others : [...others, { text }]
+    const changed = text !== current
+    if (changed) {
+      forgetInteractions(index)
+      delete turn.tokens
+      delete turn.thoughtTokens
+    }
+    const first = turn.parts.findIndex(body)
+    turn.parts = turn.parts.flatMap((part, at) =>
+      !body(part) ? [part] : at === first && text !== '' ? [{ text }] : [],
+    )
+    if (first === -1 && text !== '') turn.parts.push({ text })
     scheduleSave()
+    if (changed) scheduleTokens()
   }
 
-  // deleteTurn 删除一轮，其后的交互不再用于续接
+  // deleteTurn 删除一轮并重新统计 token，其后的交互不再用于续接
   function deleteTurn(index: number): void {
-    session.turns.splice(index, 1)
+    const [removed] = session.turns.splice(index, 1)
+    if (removed) revokeTurnURLs([removed])
     forgetInteractions(index)
     scheduleSave()
+    scheduleTokens()
   }
 
-  // branch 以前 index+1 轮创建新对话并返回其 ID
+  // branch 以调用时对话的前 index+1 轮与运行设置创建新对话并返回其 ID；历史记录的 token 数包含全部轮次时与当前对话相同，否则统计这些轮次与系统指令的输入 token，统计失败时不记录
   async function branch(
     index: number,
     titleKey: 'pg.branchOf' | 'pg.copyOf' = 'pg.branchOf',
   ): Promise<string> {
     const id = newTurnID()
-    await api.savePrompt<PromptData>(id, {
+    const turns = session.turns.slice(0, index + 1)
+    const model = currentModel.value
+    const prompt = {
       title: useI18n()
         .t(titleKey)
         .replace('{title}', session.title || promptTitle()),
       model: session.settings.model,
       description: session.description,
-      data: cloneData({ settings: session.settings, turns: session.turns.slice(0, index + 1) }),
-    })
+      turns: index + 1,
+      data: cloneData({ settings: session.settings, turns }),
+    }
+    const tokens =
+      index === session.turns.length - 1
+        ? session.promptTokens
+        : model === undefined
+          ? null
+          : await countPrompt(model, turns, hasSystemInput(), new AbortController().signal).then(
+              (result) => result.count,
+              () => null,
+            )
+    await persistLocalMedia(prompt.data.turns)
+    await api.savePrompt<PromptData>(id, { ...prompt, ...(tokens !== null && { tokens }) })
     return id
   }
 
@@ -607,12 +1010,20 @@ function createSession(temporary = false, links: SessionLinks = {}) {
     if (item.search) enable('google_search')
     if (item.codeExecution) enable('code_execution')
     session.draft = item.prompt
+    for (const part of session.attachments) revokeAttachmentURL(part)
     session.attachments = []
     try {
       for (const url of item.images ?? []) {
         const response = await fetch(url)
         if (!response.ok) throw new Error(`${response.status} ${url}`)
-        session.attachments.push({ inlineData: await readImage(await response.blob()) })
+        const blob = await response.blob()
+        const mimeType = blob.type || 'image/png'
+        session.attachments.push(
+          session.temporary
+            ? localAttachment(blob, mimeType)
+            : await uploadAttachment(blob, mimeType),
+        )
+        void countAttachment(session.attachments.at(-1)!)
       }
     } catch (error) {
       const failed = useI18n().t('pg.sampleImageFailed')
@@ -630,7 +1041,8 @@ function createSession(temporary = false, links: SessionLinks = {}) {
   // dispose 中止生成与保存并停止监听
   function dispose(): void {
     discard()
-    tokenController?.abort()
+    revokeTurnURLs(session.turns)
+    for (const part of session.attachments) revokeAttachmentURL(part)
     scope.stop()
   }
 
@@ -639,19 +1051,35 @@ function createSession(temporary = false, links: SessionLinks = {}) {
       () => [session.settings, session.temporary] as const,
       ([settings], [previous]) => {
         if (settings !== previous && settings === opened) return
-        if ((session.id !== null || session.turns.length > 0) && !session.running) scheduleSave()
+        if (
+          (session.id !== null || session.turns.length > 0 || links.canSave?.()) &&
+          !session.running
+        )
+          scheduleSave()
       },
       { deep: true },
     )
     watch(
       () => currentModel.value?.id,
-      () => void refreshTokens(),
+      () => {
+        scheduleTokens()
+        scheduleDraftTokens()
+      },
+      { immediate: true },
+    )
+    watch(() => draftSource().text, scheduleDraftTokens)
+    watch(
+      () => [session.settings, session.settings.systemInstruction] as const,
+      ([settings], [previous]) => {
+        if (settings === previous) scheduleTokens(draftCountDelay)
+      },
     )
   })
 
   return {
     session,
     currentModel,
+    usage,
     newChat,
     ensureModel,
     selectModel,
@@ -669,6 +1097,9 @@ function createSession(temporary = false, links: SessionLinks = {}) {
     applyStarter,
     rename,
     save,
+    cancelSave,
+    scheduleSave,
+    clearSave,
     pending,
     refreshTokens,
     countAttachment,
@@ -698,7 +1129,9 @@ function comparePane(): CompareData | undefined {
 
 // flush 在切换对话前立即保存页面对话与对比模式右侧窗格尚未写入的内容，生成中保存已收到的内容
 function flush(): void {
-  if (panes.some((pane) => pane.pending())) void main.save()
+  if (!panes.some((pane) => pane.pending())) return
+  for (const pane of panes) pane.clearSave()
+  void main.save()
 }
 
 // newChat 保存当前对话后开始一个空白对话并退出对比模式，systemInstruction 为新对话的系统指令
@@ -708,15 +1141,13 @@ function newChat(systemInstruction = ''): void {
   main.newChat(systemInstruction)
 }
 
-// open 读取对话库中的对话，切换到其他对话时退出对比模式，对话带右侧窗格时恢复对比模式
+// open 读取对话库中的对话，读取完成且仍是最新选择时退出对比模式再换入该对话，对话带右侧窗格时恢复对比模式
 async function open(
   id: string,
   loaded?: SavedPrompt<PromptData>,
 ): Promise<SavedPrompt<PromptData> | undefined> {
-  if (main.session.id === id) return undefined
-  flush()
-  leaveCompare()
-  const prompt = await main.open(id, loaded)
+  if (main.session.id !== id) flush()
+  const prompt = await main.open(id, loaded, leaveCompare)
   const compare = prompt?.data.compare
   if (compare) {
     const pane = addPane({
@@ -735,7 +1166,7 @@ async function deletePrompt(): Promise<void> {
   const id = main.session.id
   leaveCompare()
   main.newChat()
-  if (id !== null) await api.deletePrompt(id)
+  if (id !== null && (await main.cancelSave(id))) await api.deletePrompt(id)
 }
 
 // page 为对话实例加上页面级操作
@@ -779,9 +1210,11 @@ watch(
   },
 )
 
-// setSync 与官网一致切换系统指令同步，开启时把 index 窗格的系统指令写入右侧窗格
+// setSync 与官网一致切换系统指令同步并保存页面对话，开启时把 index 窗格的系统指令写入右侧窗格
 function setSync(index: number, value: boolean): void {
   syncInstructions.value = value
+  if (!main.session.temporary && (main.session.id !== null || main.session.turns.length > 0))
+    main.scheduleSave()
   if (!value) return
   const text = panes[index]!.session.settings.systemInstruction
   for (const pane of panes.slice(1)) pane.session.settings.systemInstruction = text
@@ -792,9 +1225,18 @@ const running = computed(() => panes.some((pane) => pane.session.running))
 
 // addPane 以 data 的运行设置与对话加入右侧窗格并返回它，右侧窗格变化时保存页面对话
 function addPane(data: PaneData): Playground {
-  const pane = page(createSession(true, { save: main.save }))
-  pane.session.settings = cloneData(data.settings)
-  pane.session.turns = cloneData(data.turns)
+  const pane = page(
+    createSession(
+      true,
+      {
+        save: main.save,
+        canSave: () =>
+          !main.session.temporary && (main.session.id !== null || main.session.turns.length > 0),
+        draft: () => ({ text: main.session.draft, attachments: main.session.attachments }),
+      },
+      data,
+    ),
+  )
   panes.push(pane)
   return pane
 }
@@ -807,8 +1249,11 @@ function enterCompare(): void {
     turns: main.session.turns.map((turn) => ({ ...turn, id: newTurnID() })),
   })
   pane.session.promptTokens = main.session.promptTokens
+  pane.session.systemTokens = main.session.systemTokens
   pane.session.rawMode = main.session.rawMode
   syncInstructions.value = true
+  if (!main.session.temporary && (main.session.id !== null || main.session.turns.length > 0))
+    void main.save()
 }
 
 // leaveCompare 关闭右侧窗格回到单对话
@@ -822,11 +1267,13 @@ function closePane(index: number): void {
   if (index === 0) {
     main.stop()
     right.stop()
+    revokeTurnURLs(main.session.turns)
     Object.assign(main.session, {
       settings: right.session.settings,
       turns: right.session.turns,
       promptTokens: right.session.promptTokens,
     })
+    right.session.turns = []
   }
   leaveCompare()
   if (main.session.id !== null) void main.save()
@@ -889,6 +1336,7 @@ export function useCompare() {
     submitAll,
     appendAll,
     stopAll,
+    flush,
     toggleRaw,
   }
 }

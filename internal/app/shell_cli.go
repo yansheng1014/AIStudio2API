@@ -20,8 +20,13 @@ type uiShell struct {
 }
 
 // newShell 创建命令行版的管理界面宿主，open 为 true 时打开系统浏览器；生成服务在 run 返回后结束
-func newShell(open bool, _ func()) *uiShell {
+func newShell(open, _ bool, _ func()) *uiShell {
 	return &uiShell{open: open}
+}
+
+// pickPath 返回 nil，命令行版没有系统对话框
+func (s *uiShell) pickPath() func(start string) (string, error) {
+	return nil
 }
 
 // run 等待 start 返回管理服务就绪，需要时用系统浏览器打开管理页面，等到 ctx 结束；启动失败的原因由服务返回
@@ -33,9 +38,9 @@ func (s *uiShell) run(ctx context.Context, start func() (serviceReady, error)) e
 	pageURL, log := service.url, service.log
 	if s.open {
 		if err := openBrowser(pageURL); err != nil {
-			log("WARN", fmt.Sprintf("管理页面打开失败，请在浏览器中打开 %s | 错误=%v", pageURL, err))
+			log("WARN", "无法打开浏览器，请手动打开管理页面", "addr", pageURL, "error", err)
 		} else {
-			log("INFO", "管理页面已打开 | 地址="+pageURL)
+			log("INFO", "管理页面已打开", "addr", pageURL)
 		}
 	}
 	<-ctx.Done()

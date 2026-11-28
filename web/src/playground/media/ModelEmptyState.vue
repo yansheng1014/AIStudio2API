@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { ref } from 'vue'
 import { useI18n } from '@/i18n'
 import UiIcon from '@/playground/ui/UiIcon.vue'
 
@@ -13,20 +14,24 @@ export interface Example {
   title: string
   prompt: string
   preview: string
+  video?: string
   detection?: { label: string; inset?: string }
 }
 
 defineProps<{
-  kind: 'music' | 'chat' | 'images' | 'robotics' | 'live'
+  kind: 'music' | 'chat' | 'images' | 'robotics' | 'live' | 'video'
   title: string
   description: string
   starters: readonly Starter[]
   examples: readonly Example[]
   clickableTitle?: boolean
   docs?: string | undefined
+  caption?: string | undefined
 }>()
 const emit = defineEmits<{ starter: [item: Starter]; example: [item: Example]; title: [] }>()
 const { t } = useI18n()
+// played 是指针或焦点到过的示例卡下标，卡片第一次被指向时才载入它的示例视频
+const played = ref(new Set<number>())
 </script>
 
 <template>
@@ -59,32 +64,64 @@ const { t } = useI18n()
           <UiIcon name="external" :size="14" class="empty-state__external-icon" />
         </a>
       </div>
-      <div class="empty-state__examples" :data-count="examples.length">
-        <div
-          v-for="(item, index) in examples"
-          :key="item.title"
-          class="tile"
-          :style="{ '--i': index }"
-        >
-          <button type="button" class="tile__frame" @click="emit('example', item)">
-            <span class="tile__media">
-              <span class="tile__halo" aria-hidden="true"></span>
-              <span class="tile__window">
-                <img :src="item.preview" alt="" />
-                <span
-                  v-if="item.detection"
-                  class="detection"
-                  :style="item.detection.inset ? { inset: item.detection.inset } : undefined"
-                  aria-hidden="true"
-                >
-                  <b>{{ item.detection.label }}</b>
+      <div class="empty-state__showcase">
+        <p v-if="caption" class="empty-state__examples-caption">
+          <svg class="empty-state__examples-caption-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <defs>
+              <linearGradient id="empty-state-caption-gradient" x1="0" y1="1" x2="1" y2="0">
+                <stop offset="33%" stop-color="#346bf1" />
+                <stop offset="49%" stop-color="#3186ff" />
+                <stop offset="66%" stop-color="#4fa0ff" />
+              </linearGradient>
+            </defs>
+            <path
+              fill="url(#empty-state-caption-gradient)"
+              d="M12 2c0 5.52 4.48 10 10 10-5.52 0-10 4.48-10 10 0-5.52-4.48-10-10-10 5.52 0 10-4.48 10-10z"
+            />
+          </svg>
+          {{ caption }}
+        </p>
+        <div class="empty-state__examples" :data-count="examples.length">
+          <div
+            v-for="(item, index) in examples"
+            :key="item.title"
+            class="tile"
+            :style="{ '--i': index }"
+            @pointerenter="played.add(index)"
+            @focusin="played.add(index)"
+          >
+            <button type="button" class="tile__frame" @click="emit('example', item)">
+              <span class="tile__media">
+                <span class="tile__halo" aria-hidden="true"></span>
+                <span class="tile__window">
+                  <img :src="item.preview" alt="" />
+                  <video
+                    v-if="item.video"
+                    class="tile__video"
+                    :src="played.has(index) ? item.video : undefined"
+                    autoplay
+                    muted
+                    loop
+                    playsinline
+                    preload="none"
+                    aria-hidden="true"
+                  ></video>
+                  <span
+                    v-if="item.detection"
+                    class="detection"
+                    :style="item.detection.inset ? { inset: item.detection.inset } : undefined"
+                    aria-hidden="true"
+                  >
+                    <b>{{ item.detection.label }}</b>
+                  </span>
                 </span>
               </span>
-            </span>
-            <span class="tile__label">
-              {{ item.title }}
-            </span>
-          </button>
+              <span class="tile__label">
+                <UiIcon v-if="item.video" name="playFill" :size="14" class="tile__play-icon" />
+                {{ item.title }}
+              </span>
+            </button>
+          </div>
         </div>
       </div>
     </section>
@@ -184,13 +221,11 @@ const { t } = useI18n()
 
 @keyframes empty-arrive {
   0% {
-    filter: blur(6px);
     opacity: 0;
     transform: translateY(10px);
   }
 
   to {
-    filter: none;
     opacity: 1;
     transform: none;
   }
@@ -223,6 +258,32 @@ const { t } = useI18n()
   background: var(--fill);
 }
 
+.empty-state__showcase {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.empty-state__examples-caption {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 21px;
+  animation: empty-arrive 0.7s cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation-delay: 0.1s;
+}
+
+.empty-state__examples-caption-icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+}
+
 .empty-state__examples {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -240,90 +301,54 @@ const { t } = useI18n()
 
 .tile__halo {
   position: absolute;
-  inset: 0;
-  animation: empty-halo-sway calc(var(--empty-duration) * 1.5) ease-in-out infinite alternate;
-  transition: opacity 0.3s;
-}
-
-.tile__halo::after,
-.tile__halo::before {
-  position: absolute;
-  inset: -3px;
-  border-radius: 20px;
+  inset: -40px;
   background: conic-gradient(
     from 220deg,
-    #3186ff,
-    #3186ff 22%,
-    #ff4641 40%,
+    #1d7cff,
+    #1d7cff 22%,
+    #ff2e28 40%,
     #fc0 58%,
-    #0ebc5f 76%,
-    #3186ff
+    #00c858 76%,
+    #1d7cff
   );
-  content: '';
-  filter: blur(16px) saturate(1.3);
+  mask-image:
+    linear-gradient(
+      to right,
+      transparent 0,
+      rgb(0 0 0 / 6%) 12px,
+      rgb(0 0 0 / 24%) 26px,
+      rgb(0 0 0 / 78%) 48px,
+      rgb(0 0 0 / 78%) calc(100% - 48px),
+      rgb(0 0 0 / 24%) calc(100% - 26px),
+      rgb(0 0 0 / 6%) calc(100% - 12px),
+      transparent 100%
+    ),
+    linear-gradient(
+      to bottom,
+      transparent 0,
+      rgb(0 0 0 / 6%) 12px,
+      rgb(0 0 0 / 24%) 26px,
+      rgb(0 0 0 / 78%) 48px,
+      rgb(0 0 0 / 78%) calc(100% - 48px),
+      rgb(0 0 0 / 24%) calc(100% - 26px),
+      rgb(0 0 0 / 6%) calc(100% - 12px),
+      transparent 100%
+    );
+  mask-composite: intersect;
   opacity: 0;
-}
-
-.tile__halo::before {
-  animation: empty-halo-visit calc(var(--empty-duration) * 2) ease-in-out infinite;
-  animation-delay: calc(0.5s + var(--i) * var(--empty-duration) * 2 / var(--count));
-}
-
-.empty-state__examples[data-count='1'] .tile__halo::before {
-  animation-name: empty-halo-breathe;
-}
-
-.tile__halo::after {
+  pointer-events: none;
   transition: opacity 0.35s;
 }
 
-.tile:focus-within .tile__halo::after,
-.tile:hover .tile__halo::after {
+.tile:first-child .tile__halo,
+.tile:focus-within .tile__halo,
+.tile:hover .tile__halo {
   opacity: var(--halo);
-}
-
-.tile:focus-within .tile__halo::before,
-.tile:hover .tile__halo::before {
-  animation-play-state: paused;
 }
 
 .empty-state__examples:has(.tile:focus-within) .tile:not(:focus-within) .tile__halo,
 .empty-state__examples:has(.tile:hover) .tile:not(:hover) .tile__halo {
   opacity: 0;
-}
-
-@keyframes empty-halo-visit {
-  0%,
-  36%,
-  to {
-    opacity: 0;
-  }
-
-  8%,
-  26% {
-    opacity: var(--halo);
-  }
-}
-
-@keyframes empty-halo-breathe {
-  0%,
-  to {
-    opacity: calc(var(--halo) * 0.35);
-  }
-
-  50% {
-    opacity: var(--halo);
-  }
-}
-
-@keyframes empty-halo-sway {
-  0% {
-    transform: rotate(-4deg);
-  }
-
-  to {
-    transform: rotate(4deg);
-  }
 }
 
 .tile__frame {
@@ -379,8 +404,7 @@ const { t } = useI18n()
   max-width: calc(100% - 20px);
   padding: 5px 10px;
   border-radius: 12px;
-  backdrop-filter: blur(8px);
-  background: rgb(0 0 0 / 55%);
+  background: rgb(0 0 0 / 74%);
   color: var(--color-v3-text-on-button-reverse);
   font-size: 12px;
   line-height: 1.3;
@@ -507,6 +531,76 @@ const { t } = useI18n()
   aspect-ratio: 1;
 }
 
+.tile__video {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.25s ease;
+}
+
+.tile:focus-within .tile__video,
+.tile:hover .tile__video {
+  opacity: 1;
+}
+
+.tile__play-icon {
+  flex: none;
+}
+
+.empty-state[data-kind='video'] .empty-state__examples {
+  grid-template-columns: 1.4fr 1fr;
+}
+
+.empty-state[data-kind='video'] .tile__media {
+  aspect-ratio: 4 / 3;
+}
+
+.empty-state[data-kind='video'] .tile:nth-child(2) .tile__media {
+  aspect-ratio: auto;
+}
+
+.empty-state[data-kind='video'] .empty-state__examples[data-count='3'] {
+  grid-template-columns: 1fr 1.25fr;
+  grid-template-rows: 1fr 1fr;
+}
+
+.empty-state[data-kind='video'] .empty-state__examples[data-count='3'] .tile:first-child {
+  grid-row: 1 / -1;
+}
+
+.empty-state[data-kind='video']
+  .empty-state__examples[data-count='3']
+  .tile:first-child
+  .tile__media {
+  aspect-ratio: 9 / 16;
+}
+
+.empty-state[data-kind='video']
+  .empty-state__examples[data-count='3']
+  .tile:not(:first-child)
+  .tile__media {
+  aspect-ratio: auto;
+}
+
+.empty-state[data-kind='video'] img {
+  animation: empty-push-in calc(var(--empty-duration) * 2.5) ease-in-out infinite alternate;
+}
+
+@keyframes empty-push-in {
+  0% {
+    transform: scale(1.02);
+  }
+
+  to {
+    transform: scale(1.1) translate(-1.5%, 1%);
+  }
+}
+
 @container (max-width: 640px) {
   .empty-state {
     grid-template-columns: minmax(0, 1fr);
@@ -556,6 +650,8 @@ const { t } = useI18n()
 
 @media (prefers-reduced-motion: reduce) {
   .empty-state h3,
+  .empty-state[data-kind='video'] img,
+  .empty-state__examples-caption,
   .detection,
   .empty-state__docs-link,
   .empty-state__description,
@@ -563,15 +659,9 @@ const { t } = useI18n()
   .starters li,
   .tile,
   .tile__frame,
-  .tile__halo,
-  .tile__halo::after,
-  .tile__halo::before {
+  .tile__halo {
     animation: none;
     transition: none;
-  }
-
-  .tile:first-child .tile__halo::before {
-    opacity: var(--halo);
   }
 
   .tile:hover .tile__frame {

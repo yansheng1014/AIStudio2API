@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,7 +15,11 @@ import (
 
 // Config 定义公开 API 服务配置
 type Config struct {
-	APIKey           string
+	// PickPath 以系统对话框选择账户目录并返回选中的路径，用户取消时返回空串；只在桌面版提供
+	PickPath func(start string) (string, error)
+	APIKey   string
+	// APIKeys 返回当前生效的逗号分隔 API key，为空时使用 APIKey
+	APIKeys          func() string
 	Admin            AdminService
 	AdminAuthEnabled bool
 	AdminUsername    string
@@ -53,6 +58,7 @@ type ResponseModes struct {
 type server struct {
 	service           aistudio.Service
 	config            Config
+	adminAuth         *adminAuth
 	responseStates    *responseStateStore
 	uploads           *geminiUploads
 	caches            *geminiCaches
@@ -81,8 +87,16 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 		}
 	}
 	public := http.NewServeMux()
-	public.HandleFunc("GET /v1/models", s.handleOpenAIModels)
-	public.HandleFunc("GET /v1/models/{model...}", s.handleOpenAIModel)
+	public.HandleFunc("GET /v1/models", geminiOr(s.handleGeminiModels, s.handleOpenAIModels))
+	public.HandleFunc("GET /v1/models/{model...}", geminiOr(s.handleGeminiModel, s.handleOpenAIModel))
+	public.HandleFunc("POST /v1/models/{action}", s.handleGeminiAction)
+	public.HandleFunc("GET /v1/operations/{operation}", s.handleGeminiVideoOperation)
+	public.HandleFunc("POST /upload/v1/files", s.handleGeminiFileUpload)
+	public.HandleFunc("POST /v1/cachedContents", s.handleGeminiCacheCreate)
+	public.HandleFunc("GET /v1/cachedContents", s.handleGeminiCacheList)
+	public.HandleFunc("GET /v1/cachedContents/{cache}", s.handleGeminiCacheGet)
+	public.HandleFunc("PATCH /v1/cachedContents/{cache}", s.handleGeminiCacheUpdate)
+	public.HandleFunc("DELETE /v1/cachedContents/{cache}", s.handleGeminiCacheDelete)
 	public.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	public.HandleFunc("POST /v1/embeddings", s.handleOpenAIEmbeddings)
 	public.HandleFunc("POST /v1/responses", s.handleResponses)
@@ -101,10 +115,10 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 	public.HandleFunc("POST /v1/interactions/{id}/cancel", s.handleInteractionCancel)
 	public.HandleFunc("POST /v1beta/interactions/{id}/cancel", s.handleInteractionCancel)
 	public.HandleFunc("POST /v1/files", s.handleFileUpload)
-	public.HandleFunc("GET /v1/files", s.handleFileList)
-	public.HandleFunc("GET /v1/files/{file}", s.handleFileGet)
+	public.HandleFunc("GET /v1/files", geminiOr(s.handleGeminiFileList, s.handleFileList))
+	public.HandleFunc("GET /v1/files/{file}", geminiOr(s.handleGeminiFileGet, s.handleFileGet))
 	public.HandleFunc("GET /v1/files/{file}/content", s.handleFileContent)
-	public.HandleFunc("DELETE /v1/files/{file}", s.handleFileDelete)
+	public.HandleFunc("DELETE /v1/files/{file}", geminiOr(s.handleGeminiFileDelete, s.handleFileDelete))
 	public.HandleFunc("POST /v1/images/generations", s.handleOpenAIImages)
 	public.HandleFunc("POST /v1/images/edits", s.handleOpenAIImageEdits)
 	public.HandleFunc("POST /v1/audio/speech", s.handleOpenAISpeech)
@@ -123,6 +137,7 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 	public.HandleFunc("GET /v1beta/models/{model...}", s.handleGeminiModel)
 	public.HandleFunc("POST /v1beta/models/{action}", s.handleGeminiAction)
 	public.HandleFunc("GET /v1beta/operations/{operation}", s.handleGeminiVideoOperation)
+	public.HandleFunc("POST /v1beta/decisions", s.handleDecision)
 	public.HandleFunc("POST /upload/v1beta/files", s.handleGeminiFileUpload)
 	public.HandleFunc("GET /v1beta/files", s.handleGeminiFileList)
 	public.HandleFunc("GET /v1beta/files/{file}", s.handleGeminiFileGet)
@@ -145,12 +160,19 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 
 	root := http.NewServeMux()
 	root.Handle("GET /health", corsMiddleware(http.HandlerFunc(s.handleHealth)))
-	publicHandler := bodyLimitMiddleware(browserOriginMiddleware(config.APIKey, authMiddleware(config.APIKey, apiKeyContextMiddleware(config.APIKey, requestBodyMiddleware(config.Ledger, waitLaunchMiddleware(config.WaitLaunch, public))))))
+	keySource := config.APIKeys
+	if keySource == nil {
+		staticKey := config.APIKey
+		keySource = func() string { return staticKey }
+	}
+	s.config.APIKeys = keySource
+	publicHandler := bodyLimitMiddleware(browserOriginMiddleware(keySource, authMiddleware(keySource, apiKeyContextMiddleware(keySource, accountContextMiddleware(requestEncodingMiddleware(requestBodyMiddleware(config.Ledger, waitLaunchMiddleware(config.WaitLaunch, s.catalogRead, public))))))))
 	loggedHandler := requestLoggingMiddleware(config.Admin, corsMiddleware(publicHandler))
 	root.Handle("/v1/", loggedHandler)
 	root.Handle("/v1beta/", loggedHandler)
 	root.Handle("/upload/", requestLoggingMiddleware(config.Admin, corsMiddleware(s.geminiUploadHandler(publicHandler))))
-	root.Handle("/api/", newAdminAuth(config).handler(control))
+	s.adminAuth = newAdminAuth(config)
+	root.Handle("/api/", s.adminAuth.handler(control))
 	if config.MediaDir != "" {
 		root.Handle("GET /media/{file}", corsMiddleware(http.HandlerFunc(s.handleMedia)))
 	}
@@ -159,15 +181,46 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 	return root
 }
 
-// waitLaunchMiddleware 让请求在生成服务启动期间等到启动结束再处理，wait 为空时直接处理
-func waitLaunchMiddleware(wait func(context.Context), next http.Handler) http.Handler {
+// geminiOr 返回把以 Gemini API 方式鉴权的请求交给 gemini、其余交给 openai 的处理函数，供 /v1 下两个协议共用的路径
+func geminiOr(gemini, openai http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if geminiAuth(r) {
+			gemini(w, r)
+			return
+		}
+		openai(w, r)
+	}
+}
+
+// waitLaunchMiddleware 让请求在生成服务启动期间等到启动结束再处理，已发布的公开目录能回答的模型查询直接处理，wait 为空时直接处理
+func waitLaunchMiddleware(wait func(context.Context), catalogRead func(*http.Request) bool, next http.Handler) http.Handler {
 	if wait == nil {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		wait(r.Context())
+		if !catalogRead(r) {
+			wait(r.Context())
+		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// catalogRead 判断请求是否为已发布的公开目录能回答的模型查询：目录非空时的模型列表，或目录中已有该模型的单模型查询
+func (s *server) catalogRead(r *http.Request) bool {
+	path := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/v1beta"), "/v1")
+	if r.Method != http.MethodGet || path != "/models" && (!strings.HasPrefix(path, "/models/") || strings.Contains(path, "/operations/")) {
+		return false
+	}
+	models, err := s.service.Models(r.Context())
+	if err != nil || len(models) == 0 {
+		return false
+	}
+	id, single := strings.CutPrefix(path, "/models/")
+	if !single {
+		return true
+	}
+	_, found := LookupPublicModel(s.searchModels(models), id)
+	return found
 }
 
 func newID(prefix string) string {

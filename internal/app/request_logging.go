@@ -1,12 +1,16 @@
 package app
 
 import (
+	"cmp"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
+	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
 	"github.com/Mag1cFall/AIStudio2API/internal/requestdb"
 )
 
@@ -15,12 +19,18 @@ func requestLogData(entry api.AccessLog) *api.RequestLog {
 	data := &api.RequestLog{
 		ID: entry.RequestID, Model: entry.Model, Method: entry.Method, Path: entry.Path,
 		Status: entry.Status, DurationMS: float64(entry.Latency) / float64(time.Millisecond),
-		ToolCalls: entry.ToolCalls, FinishReason: entry.FinishReason, Error: entry.Error,
+		ToolCalls: entry.ToolCalls, ReplyTool: entry.ReplyTool, FinishReason: entry.FinishReason, Error: entry.Error,
 		InputMessages: entry.InputMessages, InputTextChars: entry.InputTextChars,
 		InputMedia: entry.InputMedia, InputMediaBytes: entry.InputMediaBytes, InputFiles: entry.InputFiles,
 		FirstEventMS: float64(entry.FirstEvent) / float64(time.Millisecond), UpstreamBytes: entry.UpstreamBytes,
-		QueueMS: float64(entry.QueueWait) / float64(time.Millisecond), ProofMS: float64(entry.Proof) / float64(time.Millisecond),
+		QueueMS: float64(entry.QueueWait) / float64(time.Millisecond), ProofMS: float64(entry.Proof.Total) / float64(time.Millisecond),
 		Channel: entry.Channel,
+	}
+	if entry.Proof.Total > 0 {
+		data.ProofPhases = &api.RequestLogProofPhases{ProofPhasesMS: api.ProofPhasesMS{
+			LockMS: float64(entry.Proof.Lock) / float64(time.Millisecond), InteractionMS: float64(entry.Proof.Interaction) / float64(time.Millisecond),
+			RefreshMS: float64(entry.Proof.Refresh) / float64(time.Millisecond), ComputeMS: float64(entry.Proof.Compute) / float64(time.Millisecond),
+		}, SettingsSkipped: entry.Proof.SettingsSkipped}
 	}
 	if entry.Generation {
 		data.Parameters = map[string]string{
@@ -34,8 +44,8 @@ func requestLogData(entry api.AccessLog) *api.RequestLog {
 			InputTokens: usage.InputTokens + usage.ToolTokens, CachedTokens: usage.CachedTokens, ReasoningTokens: usage.ReasoningTokens,
 			ReplyTokens: usage.OutputTokens, OutputTokens: output, TotalTokens: usage.TotalTokens,
 		}
-		if entry.Latency > 0 {
-			data.Usage.AverageTokensPerSecond = float64(output) / entry.Latency.Seconds()
+		if generation := entry.Latency - entry.FirstEvent; generation > 0 && output > entry.FirstOutput {
+			data.Usage.AverageTokensPerSecond = float64(output-entry.FirstOutput) / generation.Seconds()
 		}
 	}
 	return data
@@ -68,6 +78,12 @@ func requestOutcome(entry api.AccessLog) (string, string, string) {
 // finishedRequestLog 投影请求结果日志，失败且没有错误信息时记录 HTTP 状态
 func finishedRequestLog(entry api.AccessLog) (*api.RequestLog, string, string) {
 	data := requestLogData(entry)
+	if entry.ReplyTool {
+		calls := entry.ReplyToolCalls
+		continuations := entry.ReplyToolContinuations
+		data.ReplyToolCalls = &calls
+		data.ReplyToolContinuations = &continuations
+	}
 	state, level, message := requestOutcome(entry)
 	data.State = state
 	if state == "failed" && data.Error == "" {
@@ -82,13 +98,15 @@ func (admin *runtimeAdmin) RecordAccessLog(entry api.AccessLog) {
 	admin.recordRequestLog(entry.Account, level, "request.finished", message, data)
 }
 
-// requestRow 将 POST 请求结果投影为用量账本记录
+// requestRow 将 POST 请求结果投影为用量账本记录，函数调用之后上游结束生成的错误写入记录的错误详情
 func requestRow(entry api.AccessLog, finished time.Time) requestdb.Row {
 	data, _, _ := finishedRequestLog(entry)
 	row := requestdb.Row{
 		ID: entry.RequestID, Time: finished, Protocol: requestProtocol(entry.Path), Path: entry.Path,
 		Model: entry.Model, Account: entry.Account, Channel: entry.Channel, Status: entry.Status, State: data.State,
-		Duration: entry.Latency, FirstEvent: entry.FirstEvent, Queue: entry.QueueWait, ToolCalls: entry.ToolCalls, Error: data.Error,
+		Duration: entry.Latency, FirstEvent: entry.FirstEvent, Queue: entry.QueueWait, Proof: entry.Proof,
+		ToolCalls: entry.ToolCalls, ReplyTool: entry.ReplyTool, ReplyToolCalls: entry.ReplyToolCalls, ReplyToolContinuations: entry.ReplyToolContinuations,
+		Error:    cmp.Or(data.Error, entry.TrailingError),
 		Attempts: entry.Attempts,
 	}
 	if usage := data.Usage; usage != nil {
@@ -111,7 +129,7 @@ func requestProtocol(path string) string {
 		return "interactions"
 	case strings.Contains(path, "/files"):
 		return "files"
-	case strings.HasPrefix(path, "/v1beta/"):
+	case strings.HasPrefix(path, "/v1beta/"), strings.HasPrefix(path, "/v1/models/") && strings.Contains(path, ":"), strings.HasPrefix(path, "/v1/cachedContents"):
 		return "gemini"
 	case strings.HasPrefix(path, "/v1/images/"):
 		return "images"
@@ -131,11 +149,31 @@ func (admin *runtimeAdmin) recordRequestLog(source, level, event, message string
 	admin.requests.recordLog(api.AdminLog{Source: source, Level: level, Event: event, Message: message, Request: data})
 }
 
-// logRequestProgress 将等待与恢复事件关联到所属请求，并带上登记时的模型与开始时间
-func (registry *requestRegistry) logRequestProgress(id, source, level, message string) {
+// logRequestProgress 将等待与恢复事件关联到所属请求，并带上登记时的模型与开始时间，attrs 依次为字段的英文标识与取值
+func (registry *requestRegistry) logRequestProgress(id, source, level, message string, attrs ...any) {
 	registry.mu.Lock()
 	request := registry.active[id].request
 	registry.mu.Unlock()
-	registry.recordLog(api.AdminLog{Source: source, Level: level, Event: "request.progress", Message: message,
+	registry.recordLog(api.AdminLog{Source: source, Level: level, Event: "request.progress", Message: message, Fields: logFields(attrs),
 		Request: &api.RequestLog{ID: id, State: "running", StartedAt: request.StartedAt, Model: request.Model}})
+}
+
+// attemptFields 返回一次上游尝试失败的日志字段：模型、错误链中上游 RPC 错误的 HTTP 状态与协议错误码、Google 拒绝账户时的失败类型与原因
+func attemptFields(model string, err error) []any {
+	fields := []any{"model", model}
+	var rpc *aistudio.RPCError
+	if errors.As(err, &rpc) {
+		fields = append(fields, "status", rpc.StatusCode)
+		if rpc.Code != 0 {
+			fields = append(fields, "code", rpc.Code)
+		}
+	}
+	var denial *camoufoxnative.AccessDenial
+	switch {
+	case errors.Is(err, camoufoxnative.ErrAccountVerification):
+		fields = append(fields, "cause", "verification")
+	case errors.As(err, &denial):
+		fields = append(fields, "cause", "restricted")
+	}
+	return append(fields, "reason", err)
 }

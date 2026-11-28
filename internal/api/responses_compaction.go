@@ -246,7 +246,7 @@ func compactionItemTokens(raw json.RawMessage) int {
 	return (len(encoded) + 3) / 4
 }
 
-// compactionItemSide 把条目分为 user 消息、工具输出、指令与模型侧条目
+// compactionItemSide 把条目分为 user 轮（user 消息与 agent_message）、工具输出、指令与模型侧条目
 func compactionItemSide(raw json.RawMessage) string {
 	var head struct {
 		Type string `json:"type"`
@@ -254,7 +254,7 @@ func compactionItemSide(raw json.RawMessage) string {
 	}
 	_ = json.Unmarshal(raw, &head)
 	switch {
-	case (head.Type == "" || head.Type == "message") && head.Role == "user":
+	case (head.Type == "" || head.Type == "message") && head.Role == "user", head.Type == "agent_message":
 		return "user"
 	case (head.Type == "" || head.Type == "message") && (head.Role == "system" || head.Role == "developer"):
 		return "instruction"
@@ -322,7 +322,7 @@ func truncateMiddle(text string, tokens int) string {
 // compactResponses 摘要原样保留部分之前的历史，返回 compaction 项、原样保留部分之前的 user 消息、其中的 developer 与 system 消息和摘要用量
 func (s *server) compactResponses(ctx context.Context, request responsesRequest, previous responseHistory, id string) (map[string]any, []json.RawMessage, []json.RawMessage, *aistudio.Usage, error) {
 	var items []json.RawMessage
-	for _, item := range slices.Concat(previous.Items, responsesInputItems(request.Input, id)) {
+	for _, item := range slices.Concat(previous.Items, responsesInputItems(request.inputItems(), id)) {
 		items = append(items, item.Raw)
 	}
 	if len(items) > 0 && responsesItemType(items[len(items)-1]) == "compaction_trigger" {
@@ -358,6 +358,31 @@ func conversationItems(items []json.RawMessage) []json.RawMessage {
 	return slices.DeleteFunc(slices.Clone(items), instructionItem)
 }
 
+// generateCompactionSummary 在不沿用调用方输出格式、输出上限与停止词的前提下，以非流式、禁用工具的方式生成压缩摘要
+func (s *server) generateCompactionSummary(ctx context.Context, base aistudio.GenerateRequest, instructions string) (string, *aistudio.Usage, error) {
+	summarize := base
+	summarize.Contents = append(slices.Clone(base.Contents), aistudio.Content{Role: aistudio.RoleUser, Parts: []aistudio.Part{{Text: instructions}}})
+	summarize.Tools.ToolConfig.Mode = "none"
+	summarize.Unary = true
+	summarize.Config.ResponseMIMEType = ""
+	summarize.Config.ResponseSchema = nil
+	summarize.Config.ResponseJSONSchema = nil
+	summarize.Config.MaxOutputTokens = nil
+	summarize.Config.StopSequences = nil
+	events, err := s.service.Generate(ctx, summarize)
+	if err != nil {
+		return "", nil, err
+	}
+	result, err := consumeEvents(ctx, events)
+	if err != nil {
+		return "", nil, err
+	}
+	if result.finishReason != "stop" {
+		return "", nil, fmt.Errorf("compaction summary finished with %s", result.finishReason)
+	}
+	return strings.TrimSpace(result.text.String()), result.usage, nil
+}
+
 // compactionSummary 以请求的模型、指令与工具非流式生成摘要，工具调用关闭，旧摘要作为首个 user 轮，摘要提示词作为末尾 user 轮
 func (s *server) compactionSummary(ctx context.Context, request responsesRequest, items []json.RawMessage, previous, id string) (string, *aistudio.Usage, error) {
 	prompt := compactionSummaryPrompt
@@ -377,21 +402,7 @@ func (s *server) compactionSummary(ctx context.Context, request responsesRequest
 	if err := inlineRemoteMedia(ctx, generate.Contents); err != nil {
 		return "", nil, err
 	}
-	generate.Contents = append(generate.Contents, aistudio.Content{Role: aistudio.RoleUser, Parts: []aistudio.Part{{Text: fmt.Sprintf(compactionInstructions, prompt)}}})
-	generate.Tools.ToolConfig.Mode = "none"
-	generate.Unary = true
-	events, err := s.service.Generate(ctx, generate)
-	if err != nil {
-		return "", nil, err
-	}
-	result, err := consumeEvents(ctx, events)
-	if err != nil {
-		return "", nil, err
-	}
-	if result.finishReason != "stop" {
-		return "", nil, fmt.Errorf("compaction summary finished with %s", result.finishReason)
-	}
-	return strings.TrimSpace(result.text.String()), result.usage, nil
+	return s.generateCompactionSummary(ctx, generate, fmt.Sprintf(compactionInstructions, prompt))
 }
 
 // handleResponsesCompact 返回保留的 user 消息与一个 compaction 项
@@ -432,9 +443,8 @@ func (s *server) handleResponsesCompact(w http.ResponseWriter, r *http.Request) 
 }
 
 // responsesCompactionTrigger 返回输入是否以 compaction_trigger 项结尾
-func responsesCompactionTrigger(raw json.RawMessage) bool {
-	var items []json.RawMessage
-	return json.Unmarshal(raw, &items) == nil && len(items) > 0 && responsesItemType(items[len(items)-1]) == "compaction_trigger"
+func responsesCompactionTrigger(input splitInput) bool {
+	return len(input.heads) > 0 && input.heads[len(input.heads)-1].Type == "compaction_trigger"
 }
 
 // handleCompactionTrigger 返回只含一个 compaction 项的响应，流式时依次发送 created、in_progress、compaction 项的 added 与 done、completed 事件
@@ -453,6 +463,7 @@ func (s *server) handleCompactionTrigger(w http.ResponseWriter, r *http.Request,
 				return
 			}
 		}
+		stream.setFrame(writer.progressFrame)
 		if err := writer.emit("response.output_item.added", map[string]any{"output_index": 0, "item": map[string]any{"id": "cmp_" + id, "type": "compaction", "encrypted_content": ""}}); err != nil {
 			return
 		}
@@ -492,13 +503,14 @@ func (s *server) handleCompactionTrigger(w http.ResponseWriter, r *http.Request,
 func (s *server) storeCompaction(ctx context.Context, id string, request responsesRequest, prepared responsesPreparation, item map[string]any, retained []json.RawMessage, response map[string]any) {
 	encodedItem, _ := json.Marshal(item)
 	window, _ := json.Marshal(append(slices.Clone(retained), encodedItem))
-	contents, inlineInstructions, err := responsesContents(window)
+	input := splitResponsesInput(window)
+	contents, inlineInstructions, err := responsesContents(input)
 	if err != nil || inlineRemoteMedia(ctx, contents) != nil {
 		return
 	}
 	prepared.contents = contents
 	prepared.inlineInstructions = append(slices.Clone(prepared.previous.InlineInstructions), inlineInstructions...)
-	prepared.input = responsesInputItems(window, id)
+	prepared.input = responsesInputItems(input, id)
 	prepared.previous = responseHistory{}
 	s.storeResponse(id, request, prepared, generationResult{}, response)
 }

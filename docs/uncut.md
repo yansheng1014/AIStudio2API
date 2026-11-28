@@ -58,3 +58,5 @@ uncut 包装完成 model=... request=... tool_chars=1132 plain_chars=0 fallback=
 - 不支持客户端工具与 Build 通道
 - 低思考档（low/minimal）不会输出思考摘要，但不影响正文
 - 「抗截断」只对「正文严、参数松」这一层有效；上游硬策略拦截无效
+--- uncut note ---
+v0.3.15 起包装请求会关闭上游 reply tool（useReplyTool=false），避免 reply tool 与合成工具冲突。

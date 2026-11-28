@@ -3,7 +3,7 @@ import { computed } from 'vue'
 import { useI18n } from '@/i18n'
 import CodeDialog from './CodeDialog.vue'
 import { codeOptions, generateCode, type CodeLanguage } from './code'
-import { agentConfig, buildRequest, continuation } from './request'
+import { agentFields, buildRequest, continuation } from './request'
 import { usePlayground } from './session'
 import type { Turn } from './types'
 
@@ -41,11 +41,26 @@ const turns = computed<Turn[]>(() => {
 // code 按语言生成当前对话的示例代码，请求与页面运行时以所选协议发送的请求相同
 function code(language: CodeLanguage): string {
   const input = continuation(session.settings.protocol, turns.value)
+  let localIndex = 0
+  const codeTurns = input.turns.map((turn) => ({
+    ...turn,
+    parts: turn.parts.map((part) =>
+      part.inlineData && part.inlineData.data === ''
+        ? {
+            ...part,
+            inlineData: {
+              ...part.inlineData,
+              data: btoa(`media:${part.inlineData.mediaId ?? ++localIndex}`),
+            },
+          }
+        : part,
+    ),
+  }))
   return generateCode(language, {
     model: currentModel.value,
     modelID: currentModel.value?.id ?? session.settings.model,
     baseURL: window.location.origin,
-    request: buildRequest(session.settings, currentModel.value, input.turns),
+    request: buildRequest(session.settings, currentModel.value, codeTurns),
     protocol: session.settings.protocol,
     stream: session.settings.stream,
     images: {
@@ -53,7 +68,7 @@ function code(language: CodeLanguage): string {
       size: session.settings.openAISize,
       quality: session.settings.imageQuality,
     },
-    agent: agentConfig(session.settings, currentModel.value),
+    agent: agentFields(session.settings, currentModel.value),
     previous: input.previous,
   })
 }

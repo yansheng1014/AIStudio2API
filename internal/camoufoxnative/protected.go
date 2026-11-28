@@ -1,6 +1,7 @@
 package camoufoxnative
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -16,16 +17,19 @@ import (
 	"time"
 )
 
-// ProtectedResponse 表示由固定指纹浏览器流式返回的 MakerSuite 响应
+// ProtectedResponse 表示由固定指纹浏览器流式返回的 MakerSuite 响应，Proof 为界面运行时页面应用写入请求的 proof
 type ProtectedResponse struct {
 	StatusCode int
 	Header     http.Header
 	Body       io.ReadCloser
+	Proof      string
 }
 
-// protectedMessage 是受保护请求通道上以 { 开头的控制消息：界面运行时先是发出标记，之后是状态码与响应头，最后是结束标记或错误；其余消息为 Base64 正文块
+// protectedMessage 是受保护请求通道上以 { 开头的控制消息：界面运行时先是带 proof 的发出标记，之后是状态码与响应头，最后是结束标记或错误；其余消息为 Base64 正文块
 type protectedMessage struct {
-	Sent    bool        `json:"sent"`
+	Sent  bool   `json:"sent"`
+	Proof string `json:"proof"`
+	pageProofTiming
 	Status  int         `json:"status"`
 	Headers [][2]string `json:"headers"`
 	Done    bool        `json:"done"`
@@ -164,7 +168,7 @@ func (worker *Worker) SendProtected(ctx context.Context, rawURL string, headers 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	worker.inputMu.Lock()
+	worker.lockInput()
 	worker.mu.Lock()
 	if worker.closed {
 		worker.mu.Unlock()
@@ -272,6 +276,22 @@ func browserRequestHeaders(headers http.Header) [][2]string {
 	return result
 }
 
+// SetCookies 按 storage state 的 Cookie 格式写入固定指纹浏览器
+func (worker *Worker) SetCookies(ctx context.Context, encoded []byte) error {
+	var cookies []storageCookie
+	if err := json.Unmarshal(encoded, &cookies); err != nil {
+		return fmt.Errorf("解析 Cookie: %w", err)
+	}
+	worker.mu.Lock()
+	if worker.closed {
+		worker.mu.Unlock()
+		return errors.New("Camoufox runtime 已关闭")
+	}
+	client := worker.client
+	worker.mu.Unlock()
+	return client.installCookies(ctx, cookies)
+}
+
 // StorageCookies 导出当前固定指纹浏览器 Cookie，启动时写入的 Cookie 保持写入顺序，之后出现的 Cookie 排在其后
 func (worker *Worker) StorageCookies(ctx context.Context) ([]byte, error) {
 	worker.mu.Lock()
@@ -326,14 +346,18 @@ type protectedResponseBody struct {
 	channel   *bidiChannel
 	// stop 在正文读完前关闭时中止请求，为空时在页面中止 XHR
 	stop func() error
-	// release 在关闭时结束请求所在的标签页使用，参数表示正文已读完；为空时按受保护请求结束
-	release func(done bool)
+	// release 在关闭时结束请求所在的标签页使用，参数表示正文已正常读完与正文中出现了函数调用；为空时按受保护请求结束
+	release func(completed, call bool)
+	// call 表示正文中出现了函数调用 Part，tail 是已读正文末尾不足一个标记长度的字节
+	call bool
+	tail []byte
 
-	mu       sync.Mutex
-	buffer   []byte
-	consumed int
-	done     bool
-	closed   bool
+	mu        sync.Mutex
+	buffer    []byte
+	consumed  int
+	done      bool
+	completed bool
+	closed    bool
 }
 
 func (body *protectedResponseBody) Read(target []byte) (int, error) {
@@ -352,9 +376,15 @@ func (body *protectedResponseBody) Read(target []byte) (int, error) {
 			return 0, errors.Join(err, body.worker.cancelProtectedRequest(body.contextID, body.page, body.requestID))
 		}
 		if !strings.HasPrefix(value, "{") {
+			start := len(body.buffer)
 			body.buffer, err = base64.StdEncoding.AppendDecode(body.buffer, []byte(value))
 			if err != nil {
 				return 0, fmt.Errorf("解码浏览器响应块: %w", err)
+			}
+			if !body.call {
+				window := append(body.tail, body.buffer[start:]...)
+				body.call = bytes.Contains(window, FunctionCallMarker)
+				body.tail = window[max(len(window)-len(FunctionCallMarker)+1, 0):]
 			}
 			if body.consumed++; body.consumed == protectedGrantBatch {
 				body.consumed = 0
@@ -370,6 +400,7 @@ func (body *protectedResponseBody) Read(target []byte) (int, error) {
 		}
 		if message.Error != "" || message.Done {
 			body.done = true
+			body.completed = message.Done && message.Error == ""
 			body.worker.client.closeChannel(body.requestID)
 		}
 		if message.Error != "" {
@@ -392,10 +423,10 @@ func (body *protectedResponseBody) Close() error {
 		return nil
 	}
 	body.closed = true
-	done := body.done
+	done, completed, call := body.done, body.completed, body.call
 	body.mu.Unlock()
 	if body.release != nil {
-		defer body.release(done)
+		defer body.release(completed, call)
 	} else {
 		defer body.worker.finishRequest(body.contextID)
 	}

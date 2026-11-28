@@ -1,6 +1,25 @@
+<script lang="ts">
+import { computed } from 'vue'
+import { useI18n, type TranslationKey } from '@/i18n'
+
+const { locale: formatLocale } = useI18n()
+// timeFormat and fullTimeFormat share Intl.DateTimeFormat instances across turns.
+const timeFormat = computed(
+  () => new Intl.DateTimeFormat(formatLocale.value, { hour: 'numeric', minute: '2-digit' }),
+)
+const fullTimeFormat = computed(
+  () =>
+    new Intl.DateTimeFormat(formatLocale.value, {
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    }),
+)
+</script>
+
 <script setup lang="ts">
 import {
-  computed,
   nextTick,
   onActivated,
   onDeactivated,
@@ -20,9 +39,14 @@ import { useRouter } from 'vue-router'
 import DisclosureChevron from '@/components/DisclosureChevron.vue'
 import UiCollapse from '@/components/UiCollapse.vue'
 import { useConsole } from '@/console'
-import { useI18n, type TranslationKey } from '@/i18n'
 import type { IconName } from '@/playground/ui/icons'
 import UiIcon from '@/playground/ui/UiIcon.vue'
+import {
+  attachmentName,
+  attachmentURL,
+  downloadAttachment,
+  useAttachmentPreview,
+} from './attachment'
 import { copyToClipboard } from './clipboard'
 import { useRunningClock } from './clock'
 import CodeExecutionChunk from './CodeExecutionChunk.vue'
@@ -35,11 +59,12 @@ import RunStats from './RunStats.vue'
 import ServerToolChunk from './ServerToolChunk.vue'
 import ThoughtChunk from './ThoughtChunk.vue'
 import ThoughtStep from './ThoughtStep.vue'
+import MediaViewDialog from './media/MediaViewDialog.vue'
 import VideoResult from './media/VideoResult.vue'
 import { isAgent } from './catalog'
 import { insertCitations } from './markdown'
-import { dataURL } from './protocols'
 import { useReveal } from './reveal'
+import { appends, submits } from './run-keys'
 import { youtubeVideoID } from './sample-media'
 import SegmentRun from './SegmentRun.vue'
 import { usePlayground } from './session'
@@ -52,7 +77,7 @@ const props = defineProps<{
   showLabel: boolean
   responses?: Part[] | undefined
 }>()
-const { t, locale, logText, errorText } = useI18n()
+const { t, logText, errorText } = useI18n()
 const router = useRouter()
 const { showNotice } = useConsole()
 const playground = usePlayground()
@@ -62,7 +87,7 @@ const root = ref<HTMLElement>()
 const editing = ref(false)
 const draft = ref('')
 const editor = ref<HTMLTextAreaElement>()
-// visible 表示轮次在视口附近；离屏且不在生成时用占位高度代替内容
+// visible 表示轮次在视口附近；离屏且不在生成、编辑或等待函数响应时用占位高度代替内容
 const visible = ref(true)
 const height = ref(0)
 
@@ -124,14 +149,19 @@ const revealedAnswer = useReveal(
   () => answerText.value,
   () => props.streaming,
 )
-// shownSegments 是各段与文本段当前显示的正文：生成中按逐字显示的进度截取，完成后有依据支撑时与官网一样直接显示插入引用编号的全文，key 为段的原序号
+// shownSegments 是各段与文本段当前显示的正文：生成中按逐字显示的进度截取，正文尚未揭示到的图片等后续段暂不显示，完成后有依据支撑时与官网一样直接显示插入引用编号的全文，key 为段的原序号
 const shownSegments = computed(() => {
   const { supports = [], sources = [] } = props.turn
   const cited = !props.streaming && supports.length > 0 && sources.length > 0
   const uris = sources.map((source) => source.uri)
   const encoder = new TextEncoder()
   let startByte = 0
-  const shown = segments.value.map((segment, key) => {
+  const revealed = revealedAnswer.value.length
+  const pending = cited
+    ? -1
+    : segments.value.findIndex((segment) => segment.kind === 'text' && revealed < segment.end)
+  const ordered = pending === -1 ? segments.value : segments.value.slice(0, pending + 1)
+  const shown = ordered.map((segment, key) => {
     if (segment.kind !== 'text') return { segment, text: '', key }
     if (!cited)
       return { segment, text: revealedAnswer.value.slice(segment.start, segment.end), key }
@@ -339,20 +369,8 @@ function toggleGroup(key: number): void {
 }
 // waiting 表示已提交但还没有收到任何内容
 const waiting = computed(() => props.streaming && props.turn.parts.length === 0)
-const time = computed(() =>
-  new Intl.DateTimeFormat(locale.value, { hour: 'numeric', minute: '2-digit' }).format(
-    props.turn.created,
-  ),
-)
-// fullTime 与官网一样是悬停时间时提示的日期与时刻
-const fullTime = computed(() =>
-  new Intl.DateTimeFormat(locale.value, {
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-  }).format(props.turn.created),
-)
+const time = computed(() => timeFormat.value.format(props.turn.created))
+const fullTime = computed(() => fullTimeFormat.value.format(props.turn.created))
 // roleLabel 是轮次标签：用户轮次为 User，模型轮次与官网一样所选模型为 agent 时为 Agent
 const roleLabel = computed(() => {
   if (props.turn.role === 'user') return t('pg.user')
@@ -441,6 +459,9 @@ function responseText(call: NonNullable<Part['functionCall']>): string {
     : JSON.stringify(response)
 }
 
+// editorText 是上次定高时编辑框的文字，文字只在末尾增加时按内容高度直接增高，进入编辑时为 undefined
+let editorText: string | undefined
+
 // startEdit 进入编辑：文本变为可编辑文本框
 async function startEdit(): Promise<void> {
   if (editing.value) {
@@ -449,9 +470,10 @@ async function startEdit(): Promise<void> {
   }
   draft.value = plainText()
   editing.value = true
+  editorText = undefined
   await nextTick()
-  editor.value!.focus()
   resizeEditor()
+  editor.value!.focus({ preventScroll: true })
 }
 
 // finishEdit 保存编辑结果
@@ -461,11 +483,56 @@ function finishEdit(): void {
   playground.editTurn(props.index, draft.value)
 }
 
-// resizeEditor 让编辑框随内容增高
+// onEditorKeydown 处理编辑框快捷键：Escape 与追加键保存，提交键保存并重新运行用户轮次
+function onEditorKeydown(event: KeyboardEvent): void {
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    finishEdit()
+    return
+  }
+  if (session.running) return
+  if (submits(event)) {
+    event.preventDefault()
+    finishEdit()
+    if (props.turn.role === 'user') playground.rerun(props.index)
+  } else if (appends(event)) {
+    event.preventDefault()
+    finishEdit()
+  }
+}
+
+// onEditorBlur 在焦点移出本轮时保存编辑，切换窗口或误点本轮空白处时保持编辑
+function onEditorBlur(event: FocusEvent): void {
+  if (!document.hasFocus()) return
+  const target = event.relatedTarget
+  if (
+    target instanceof HTMLElement &&
+    target.classList.contains('chat-turn-container') &&
+    root.value?.contains(target)
+  ) {
+    editor.value?.focus({ preventScroll: true })
+    return
+  }
+  finishEdit()
+}
+
+// resizeEditor 让编辑框随内容增高并保持滚动容器位置
 function resizeEditor(): void {
   const element = editor.value!
+  const text = element.value
+  const appended =
+    editorText !== undefined && text.length > editorText.length && text.startsWith(editorText)
+  editorText = text
+  if (appended) {
+    if (element.scrollHeight > element.clientHeight)
+      element.style.height = `${element.scrollHeight}px`
+    return
+  }
+  const scroller = element.closest<HTMLElement>('.chat-scroller')
+  const top = scroller?.scrollTop
   element.style.height = 'auto'
   element.style.height = `${element.scrollHeight}px`
+  if (scroller && top !== undefined) scroller.scrollTop = top
 }
 
 // plainText 返回本轮正文的 Markdown 原文
@@ -500,10 +567,11 @@ const resize = new ResizeObserver(([entry]) => {
   if (visible.value) height.value = entry!.contentRect.height
 })
 
-// observe 观察轮次是否在视口附近与它的高度
+// observe 观察轮次是否在视口附近与它的高度，轮次没有渲染时跳过
 function observe(): void {
-  intersection.observe(root.value!)
-  resize.observe(root.value!)
+  if (!root.value) return
+  intersection.observe(root.value)
+  resize.observe(root.value)
 }
 
 // disconnect 停止观察轮次
@@ -519,7 +587,10 @@ onMounted(() => {
   )
   observe()
 })
+// preview 是用户轮次附件的预览对话框：点击图片、视频、音频、文本与 PDF 附件打开
+const { preview, show: showAttachment, release: releasePreview } = useAttachmentPreview()
 onUnmounted(disconnect)
+onUnmounted(releasePreview)
 onDeactivated(disconnect)
 onActivated(observe)
 </script>
@@ -531,7 +602,10 @@ onActivated(observe)
     class="chat-turn"
     :class="{ 'thought-host': hasThoughtSegment }"
   >
-    <div v-if="!visible && !streaming && height > 0" :style="{ height: `${height}px` }"></div>
+    <div
+      v-if="!visible && !streaming && !editing && !awaitingResponse && height > 0"
+      :style="{ height: `${height}px` }"
+    ></div>
     <template v-else>
       <div v-if="hasThoughtSegment" tabindex="-1" class="chat-turn-container model">
         <div class="actions-container">
@@ -614,6 +688,7 @@ onActivated(observe)
               :style="{ visibility: waiting ? 'hidden' : undefined }"
               :aria-label="editing ? t('pg.stopEditing') : t('pg.edit')"
               :aria-disabled="session.running"
+              @mousedown.prevent
               @click="!session.running && startEdit()"
             >
               <UiIcon :name="editing ? 'check' : 'edit'" :size="20" />
@@ -745,21 +820,47 @@ onActivated(observe)
                     "
                     :class="{ step: isStep(segment) }"
                   >
-                    <template v-if="segment.part.inlineData || segment.part.fileData">
+                    <template
+                      v-if="
+                        turn.role === 'user' && (segment.part.inlineData || segment.part.fileData)
+                      "
+                    >
+                      <button
+                        v-if="segment.part.inlineData?.mimeType.startsWith('image/')"
+                        type="button"
+                        class="image-chunk"
+                        :class="{ 'chunk-gap': segment.index < answerParts.length - 1 }"
+                        :aria-label="t('pg.preview')"
+                        @click="showAttachment(segment.part)"
+                      >
+                        <img
+                          class="loaded-image"
+                          :src="attachmentURL(segment.part)"
+                          :alt="attachmentName(segment.part)"
+                        />
+                      </button>
+                      <FileChunk
+                        v-else
+                        :part="segment.part"
+                        :class="{ 'chunk-gap': segment.index < answerParts.length - 1 }"
+                        @preview="showAttachment(segment.part)"
+                      />
+                    </template>
+                    <template v-else-if="segment.part.inlineData || segment.part.fileData">
                       <img
                         v-if="segment.part.inlineData?.mimeType.startsWith('image/')"
                         class="media-image"
-                        :src="dataURL(segment.part.inlineData)"
+                        :src="attachmentURL(segment.part)"
                         alt=""
                       />
                       <audio
                         v-else-if="segment.part.inlineData?.mimeType.startsWith('audio/')"
                         controls
-                        :src="dataURL(segment.part.inlineData)"
+                        :src="attachmentURL(segment.part)"
                       ></audio>
                       <VideoResult
                         v-else-if="segment.part.inlineData?.mimeType.startsWith('video/')"
-                        :src="dataURL(segment.part.inlineData)"
+                        :src="attachmentURL(segment.part)"
                       />
                       <a
                         v-else-if="
@@ -832,8 +933,8 @@ onActivated(observe)
             class="edit-textarea"
             :aria-label="t('pg.edit')"
             @input="resizeEditor"
-            @keydown.escape.prevent="finishEdit"
-            @blur="finishEdit"
+            @keydown="onEditorKeydown"
+            @blur="onEditorBlur"
           ></textarea>
           <div v-if="sources.length && !streaming" class="grounding-sources">
             <p class="sources-title">
@@ -904,6 +1005,15 @@ onActivated(observe)
         </div>
       </div>
     </template>
+    <MediaViewDialog
+      v-if="turn.role === 'user'"
+      v-model:open="preview.open"
+      :title="preview.part ? attachmentName(preview.part) : ''"
+      :kind="preview.kind"
+      :src="preview.src"
+      :text="preview.text"
+      @download="preview.part && downloadAttachment(preview.part)"
+    />
   </div>
 </template>
 
@@ -1299,6 +1409,26 @@ onActivated(observe)
   object-fit: cover;
   margin: 4px 0 8px;
   border-radius: 8px;
+}
+
+/* image-chunk 与官网 ms-image-chunk 一致：带 1 px 边框与 4 px 圆角的图片，点击打开预览 */
+.image-chunk {
+  display: inline-block;
+  max-width: 100%;
+  padding: 0;
+  overflow: clip;
+  border: 1px solid var(--color-v3-outline-var);
+  border-radius: 4px;
+  background: none;
+  vertical-align: top;
+}
+
+.loaded-image {
+  display: block;
+  max-width: 100%;
+  max-height: min(30vh, 358px);
+  cursor: pointer;
+  object-fit: cover;
 }
 
 /* chunk-gap 为官网相邻两个用户轮次之间的间距：下内边距 24 px、上外边距 8 px、上内边距 8 px 与两条 1 px 边框 */

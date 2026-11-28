@@ -14,7 +14,7 @@ export CGO_CPPFLAGS="-I$SPIDERMONKEY_DIR/include -I$LIBWEBP_DIR/include"
 export CGO_CXXFLAGS="$CGO_CPPFLAGS"
 export CGO_LDFLAGS="-L$SPIDERMONKEY_DIR/lib -L$LIBWEBP_DIR/lib"
 npm ci --prefix web && npm run build --prefix web
-go build -trimpath -ldflags "-X github.com/Mag1cFall/AIStudio2API/internal/app.version=v0.3.1-uncut.5" -o aistudio2api ./cmd/aistudio2api
+go build -trimpath -ldflags "-X github.com/Mag1cFall/AIStudio2API/internal/app.version=v0.3.15-uncut.1" -o aistudio2api ./cmd/aistudio2api
 ```
 
 国内网络：
@@ -68,3 +68,5 @@ export GOSUMDB=off
 - 反向代理需要转发 `Host`、`X-Real-IP`、`X-Forwarded-For`、`X-Forwarded-Proto`
 - WebSocket 路径需要 `Upgrade`/`Connection` 头，否则管理页 403 或握手失败
 - 流式响应建议关闭代理缓冲（如 `X-Accel-Buffering: no`）
+--- debug note ---
+v0.3.15 构建依赖：Go 1.27.3、SpiderMonkey v158.0.1-aistudio2api.2（gcc 用 linux-amd64-gnu）、libwebp v1.6.0-aistudio2api.1。

@@ -1,27 +1,17 @@
-# Fork 变更记录（基于上游 v0.3.1）
+# Fork 变更记录
+
+## v0.3.15-uncut.1（2026-11-28）
+
+- 基线升级：上游 v0.3.1 → v0.3.15
+- 保留并适配：`-uncut` 抗截断、智能清理
+- 适配点：
+  - Client.Generate 新增 interaction/task 路由检查，包装请求拒绝之
+  - 包装模式下关闭上游 reply tool（`useReplyTool=false`），避免与合成工具冲突
+  - 智能清理配置改为从进程环境或 `.env` 读取，不依赖新版配置热更新结构
+  - Worker 空闲判定使用账户池活动状态（常驻 Worker 自带 runtimeLease）
+- 新增：`docs/uncut.md`、`docs/smart-cleanup.md`、`docs/debugging.md`、`scripts/build-linux.sh`
+- 构建依赖：Go 1.27.3、SpiderMonkey v158.0.1-aistudio2api.2（gcc 用 linux-amd64-gnu）、libwebp v1.6.0-aistudio2api.1
 
 ## v0.3.1-uncut.5
 
-### 新增
-- `internal/aistudio/anticensor.go`：`-uncut` / `防外审截断-` 模型解析、请求改写、事件还原、输入校验
-- `internal/aistudio/anticensor_test.go`：请求链/补位/校验/过滤器单测
-- `internal/api/anticensor.go`：模型目录派生 `-uncut` 别名
-- `internal/app/memory_cleanup.go`：智能清理（Go 堆回收 + 空闲 Worker 内存回收）
-
-### 修改
-- `internal/aistudio/generate.go`：解析后缀、校验、构建包装请求、事件过滤、丢弃客户端工具
-- `internal/aistudio/service.go`：账户选择/冷却使用基础模型，`-uncut` 强制 Playground
-- `internal/aistudio/types.go`：`GenerateRequest.AntiCensor` 内部标记
-- `internal/app/runtime.go`：剥离后缀并设置标记、清理配置注入、启动清理循环
-- `internal/app/worker_manager.go`：空闲 Worker 识别与页面重载/关闭辅助
-- `internal/config/config.go`、`internal/api/admin.go`、`internal/app/admin.go`：清理配置项
-- `internal/api/openai.go`、`internal/api/gemini.go`：模型列表返回 `-uncut` 别名
-
-### 文档
-- `FORK.md`、`docs/uncut.md`、`docs/smart-cleanup.md`、`docs/debugging.md`
-- `scripts/build-linux.sh`
-
-## 上游基线
-
-- 上游仓库：https://github.com/Mag1cFall/AIStudio2API
-- 基线 tag：v0.3.1
+- 初版抗截断与智能清理（基于 v0.3.1）

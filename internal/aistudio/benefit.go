@@ -27,6 +27,7 @@ var tieredRPCMethods = map[string]struct{}{
 	"CodeAssistantOffline":     {},
 	"CancelInteraction":        {},
 	"CreateInteraction":        {},
+	"CreateDecision":           {},
 	"CreateInteractionStream":  {},
 	"GetInteractionStream":     {},
 	"StreamExtractVideoFrames": {},
@@ -65,6 +66,11 @@ func (c *Client) setBenefitTier(accountID string, tier BenefitTier) {
 	c.tierMu.Lock()
 	c.tiers[accountID] = tier
 	c.tierMu.Unlock()
+}
+
+// DecodeBenefitTier 解码 GetAiStudioBenefitTier 响应正文为账户权益等级
+func DecodeBenefitTier(raw []byte) (BenefitTier, error) {
+	return decodeBenefitTier(raw)
 }
 
 func decodeBenefitTier(raw []byte) (BenefitTier, error) {
@@ -111,6 +117,8 @@ func (c *Client) applyBenefitTier(method string, accountID string, header http.H
 type ModelAccessError struct {
 	Model       string
 	AccessModes []int64
+	// Accounts 是请求限定的账户（按请求指定、key 绑定或模型绑定），为空时指全部启用账户
+	Accounts []string
 }
 
 func (e *ModelAccessError) Error() string {
@@ -127,7 +135,17 @@ func (e *ModelAccessError) Error() string {
 			names = append(names, fmt.Sprintf("访问方式 %d", mode))
 		}
 	}
-	return fmt.Sprintf("模型 %s 需要 %s，启用的账户都不具备", e.Model, strings.Join(names, " 或 "))
+	if len(e.Accounts) > 0 {
+		accounts := strings.Join(e.Accounts, "；")
+		if len(names) == 1 {
+			return fmt.Sprintf("模型 %s 需要 %s，本次请求可用的账户 %s 都不具备", e.Model, names[0], accounts)
+		}
+		return fmt.Sprintf("模型 %s 需要以下任一权益，本次请求可用的账户 %s 都不具备：%s", e.Model, accounts, strings.Join(names, "；"))
+	}
+	if len(names) == 1 {
+		return fmt.Sprintf("模型 %s 需要 %s，启用的账户都不具备", e.Model, names[0])
+	}
+	return fmt.Sprintf("模型 %s 需要以下任一权益，启用的账户都不具备：%s", e.Model, strings.Join(names, "；"))
 }
 
 // HTTPStatus 返回权益不足对应的状态码

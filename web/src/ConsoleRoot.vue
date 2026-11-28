@@ -34,7 +34,7 @@ const { startConsole, stopConsole } = useConsole()
 watch(
   () => session.value?.authenticated,
   (authenticated) => {
-    if (authenticated) void startConsole()
+    if (authenticated) startConsole()
     else stopConsole()
   },
 )
@@ -74,6 +74,7 @@ async function logout(): Promise<void> {
 onMounted(() => {
   startDesktop(locale, router)
   window.addEventListener('admin-session-expired', expireSession)
+  window.addEventListener('admin-session-changed', () => void loadSession())
   void loadSession(initialSession)
 })
 </script>

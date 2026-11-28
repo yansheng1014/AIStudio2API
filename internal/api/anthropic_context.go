@@ -65,6 +65,14 @@ type anthropicBlockHead struct {
 // anthropicCompactedMessages 丢弃最后一个 compaction 块之前的全部内容，摘要成为首个 user 消息
 func anthropicCompactedMessages(messages []anthropicMessage) []anthropicMessage {
 	for index := len(messages) - 1; index >= 0; index-- {
+		content := messages[index].Content
+		if len(content) == 0 || content[0] != '[' {
+			continue
+		}
+		var heads []anthropicBlockHead
+		if json.Unmarshal(content, &heads) == nil && !slices.ContainsFunc(heads, func(head anthropicBlockHead) bool { return head.Type == "compaction" }) {
+			continue
+		}
 		var blocks []json.RawMessage
 		if json.Unmarshal(messages[index].Content, &blocks) != nil {
 			continue
@@ -325,27 +333,15 @@ func (s *server) compactAnthropic(ctx context.Context, request anthropicRequest,
 	if instructions == "" {
 		instructions = anthropicCompactionPrompt
 	}
-	summarize := *generate
-	summarize.Contents = append(slices.Clone(generate.Contents), aistudio.Content{Role: aistudio.RoleUser, Parts: []aistudio.Part{{Text: instructions}}})
-	summarize.Tools.ToolConfig.Mode = "none"
-	summarize.Unary = true
-	events, err := s.service.Generate(ctx, summarize)
+	summary, usage, err := s.generateCompactionSummary(ctx, *generate, instructions)
 	if err != nil {
 		return nil, err
 	}
-	result, err := consumeEvents(ctx, events)
-	if err != nil {
-		return nil, err
-	}
-	if result.finishReason != "stop" {
-		return nil, fmt.Errorf("compaction summary finished with %s", result.finishReason)
-	}
-	summary := strings.TrimSpace(result.text.String())
 	if start, end := strings.Index(summary, "<summary>"), strings.LastIndex(summary, "</summary>"); start >= 0 && end > start {
 		summary = strings.TrimSpace(summary[start+len("<summary>") : end])
 	}
 	generate.Contents = []aistudio.Content{{Role: aistudio.RoleUser, Parts: []aistudio.Part{{Text: fmt.Sprintf(compactionSummaryContext, summary)}}}}
-	return &anthropicCompaction{summary: summary, usage: result.usage, pause: edit.PauseAfterCompaction}, nil
+	return &anthropicCompaction{summary: summary, usage: usage, pause: edit.PauseAfterCompaction}, nil
 }
 
 // block 返回压缩摘要的 compaction 内容块

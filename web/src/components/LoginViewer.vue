@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { api } from '@/api'
+import { useDownloadProgress } from '@/camoufox'
 import { useI18n } from '@/i18n'
+import type { PreparationStatus } from '@/types'
+import CamoufoxProgressBar from './CamoufoxProgressBar.vue'
 import UiIcon from './UiIcon.vue'
 
 // ViewerFrame 是服务端推送的画面所属页面，宽高为 CSS 像素
@@ -26,9 +29,22 @@ type ViewerMessage =
   | { type: 'dialog'; dialog: ViewerDialog | null }
   | (ViewerFrame & { type: 'frame' })
 
-const props = defineProps<{ view: string; error: string }>()
+const props = defineProps<{
+  view: string
+  error: string
+  camoufox: PreparationStatus | undefined
+  mode?: 'login' | 'verify'
+}>()
 const emit = defineEmits<{ unavailable: []; cancel: []; hide: []; close: [] }>()
 const { t } = useI18n()
+// camoufoxPercent 与 camoufoxSize 是登录浏览器启动前 Camoufox 的下载进度
+const { percent: camoufoxPercent, sizeText: camoufoxSize } = useDownloadProgress(
+  () => props.camoufox,
+)
+// camoufoxLabel 是 Camoufox 下载或解压阶段的文字
+const camoufoxLabel = computed(() =>
+  t(props.camoufox?.download ? 'accounts.downloadingBrowser' : 'camoufox.preparing'),
+)
 
 const status = ref('')
 const frame = ref<ViewerFrame | null>(null)
@@ -67,17 +83,36 @@ let touch: {
   scrolling: boolean
 } | null = null
 
-const visible = computed(() => status.value !== '' || props.error !== '')
+// preparing 表示登录浏览器在等 Camoufox 下载或解压，服务端还没有开始启动浏览器
+const preparing = computed(() => status.value === '' && props.camoufox?.preparing === true)
+const visible = computed(() => status.value !== '' || props.error !== '' || preparing.value)
 const pageURL = computed(() => (frame.value === null ? null : new URL(frame.value.url)))
 const host = computed(() => pageURL.value?.hostname ?? '')
 const secure = computed(() => pageURL.value?.protocol === 'https:')
 const busy = computed(
-  () => props.error === '' && (status.value === 'starting' || status.value === 'saving'),
+  () =>
+    props.error === '' &&
+    (preparing.value ||
+      status.value === 'starting' ||
+      status.value === 'saving' ||
+      status.value === 'checking'),
+)
+const failedTitle = computed(() =>
+  t(props.mode === 'verify' ? 'accounts.liveVerifyFailed' : 'accounts.liveFailed'),
+)
+const dialogTitle = computed(() =>
+  t(
+    props.mode === 'verify' || status.value === 'verifying'
+      ? 'accounts.verifyAccount'
+      : 'accounts.browserLogin',
+  ),
 )
 const statusText = computed(() => {
-  if (props.error !== '') return t('accounts.liveFailed')
-  if (status.value === 'starting') return t('accounts.liveStarting')
+  if (props.error !== '') return failedTitle.value
+  if (preparing.value || status.value === 'starting') return t('accounts.liveStarting')
   if (status.value === 'saving') return t('accounts.liveSaving')
+  if (status.value === 'checking') return t('accounts.liveChecking')
+  if (status.value === 'verifying' || props.mode === 'verify') return t('accounts.liveVerifying')
   return t('accounts.liveWaiting')
 })
 // fitScale 是画面完整放进画布区时的缩放，放得下时为 1
@@ -375,7 +410,7 @@ onBeforeUnmount(() => {
       class="fixed inset-0 z-[80] flex flex-col bg-canvas"
       role="dialog"
       aria-modal="true"
-      :aria-label="t('accounts.browserLogin')"
+      :aria-label="dialogTitle"
     >
       <header
         class="flex h-12 shrink-0 items-center gap-2 border-b border-line bg-panel px-2 sm:gap-3 sm:px-4"
@@ -462,6 +497,23 @@ onBeforeUnmount(() => {
         >
           <UiIcon name="spinner" :size="22" />
           {{ statusText }}
+          <div v-if="preparing" role="status" class="w-72 max-w-[80vw] text-xs">
+            <div class="flex flex-wrap justify-between gap-x-3 gap-y-1">
+              <span>{{ camoufoxLabel }}</span>
+              <span v-if="camoufoxSize" class="font-mono text-gray-500 tabular-nums"
+                >{{ camoufoxSize
+                }}<template v-if="camoufoxPercent !== null">
+                  · {{ camoufoxPercent }}%</template
+                ></span
+              >
+            </div>
+            <CamoufoxProgressBar
+              class="mt-2"
+              :label="camoufoxLabel"
+              :percent="camoufoxPercent"
+              :size-text="camoufoxSize"
+            />
+          </div>
         </div>
         <div
           v-if="reconnecting && error === ''"
@@ -521,7 +573,7 @@ onBeforeUnmount(() => {
           >
             <p class="mb-2 flex shrink-0 items-center gap-2 text-sm font-medium text-red-300">
               <UiIcon name="warning" :size="16" />
-              {{ t('accounts.liveFailed') }}
+              {{ failedTitle }}
             </p>
             <p
               class="mb-4 min-h-0 overflow-y-auto text-sm [overflow-wrap:anywhere] whitespace-pre-wrap text-gray-300"

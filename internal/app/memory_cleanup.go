@@ -62,7 +62,7 @@ func (settings cleanupSettings) withDefaults() cleanupSettings {
 
 // startMemoryCleanup 随生成服务生命周期运行，定期检查内存并按水位做最小代价的清理
 func (service *trackedService) startMemoryCleanup(ctx context.Context) {
-	config := service.cleanup.withDefaults()
+	config := loadCleanupConfig().withDefaults()
 	if !config.enabled {
 		service.requests.log("service", "INFO", "智能清理已关闭")
 		return
@@ -119,7 +119,7 @@ func (service *trackedService) runMemoryCleanup(ctx context.Context, config clea
 	}
 	startedAt := time.Now()
 	if level == "critical" {
-		evicted, err := service.workers.evictIdleWorker(ctx, accountID)
+		evicted, err := service.workers.evictIdleWorker(ctx, accountID, "memory")
 		if err != nil {
 			service.requests.log("service", "WARN", fmt.Sprintf(
 				"智能清理：关闭空闲 Worker 失败 | 账户=%s | 错误=%v", accountID, err))
@@ -135,7 +135,7 @@ func (service *trackedService) runMemoryCleanup(ctx context.Context, config clea
 			accountID, usage>>20, time.Since(startedAt).Round(time.Millisecond)))
 		return
 	}
-	evicted, err := service.workers.evictIdleWorker(ctx, accountID)
+	evicted, err := service.workers.evictIdleWorker(ctx, accountID, "memory")
 	if err != nil {
 		service.requests.log("service", "WARN", fmt.Sprintf(
 			"智能清理：关闭空闲 Worker 失败 | 账户=%s | 错误=%v", accountID, err))
@@ -195,4 +195,56 @@ func readUintFile(path string) uint64 {
 		return 0
 	}
 	return parsed
+}
+
+// loadCleanupConfig 读取智能清理配置：优先进程环境，其次工作目录下的 .env，最后使用默认值
+func loadCleanupConfig() cleanupSettings {
+	values := map[string]string{}
+	if content, err := os.ReadFile(".env"); err == nil {
+		for _, line := range strings.Split(string(content), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			if key, value, ok := strings.Cut(line, "="); ok {
+				values[strings.TrimSpace(key)] = strings.TrimSpace(value)
+			}
+		}
+	}
+	get := func(key, fallback string) string {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
+		if value, ok := values[key]; ok && value != "" {
+			return value
+		}
+		return fallback
+	}
+	seconds := func(key string, fallback int) time.Duration {
+		parsed, err := strconv.Atoi(get(key, ""))
+		if err != nil || parsed <= 0 {
+			return time.Duration(fallback) * time.Second
+		}
+		return time.Duration(parsed) * time.Second
+	}
+	megabytes := func(key string, fallback uint64) uint64 {
+		parsed, err := strconv.ParseUint(get(key, ""), 10, 64)
+		if err != nil || parsed == 0 {
+			return fallback
+		}
+		return parsed << 20
+	}
+	enabled := true
+	if parsed, err := strconv.ParseBool(get("CLEANUP_ENABLED", "true")); err == nil {
+		enabled = parsed
+	}
+	return cleanupSettings{
+		enabled:   enabled,
+		interval:  seconds("CLEANUP_INTERVAL_SECONDS", 60),
+		idle:      seconds("CLEANUP_IDLE_SECONDS", 900),
+		actionGap: seconds("CLEANUP_ACTION_GAP_SECONDS", 600),
+		high:      megabytes("CLEANUP_MEMORY_HIGH_MB", uint64(1536)<<20),
+		critical:  megabytes("CLEANUP_MEMORY_CRITICAL_MB", uint64(2560)<<20),
+		goHeap:    megabytes("CLEANUP_GO_HEAP_MB", uint64(128)<<20),
+	}
 }

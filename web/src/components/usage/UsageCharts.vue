@@ -140,6 +140,19 @@ interface TooltipItem {
 // barData 把柱状序列的零值写成 null，零高的柱不生成图形元素，提示框仍按 0 显示
 const barData = (values: number[]): (number | null)[] => values.map((value) => value || null)
 
+// lonePoints 把折线中前后都没有数据的点标成圆点，折线本身画不出它们
+const lonePoints = (data: (number | null)[]) => ({
+  symbol: 'circle',
+  symbolSize: 5,
+  silent: true,
+  label: { show: false },
+  data: data.flatMap((value, index) =>
+    value !== null && data[index - 1] == null && data[index + 1] == null
+      ? [{ coord: [index, value] }]
+      : [],
+  ),
+})
+
 // tooltipRows 生成坐标轴提示框内容，可按数值降序并追加合计
 function tooltipRows(
   items: TooltipItem[],
@@ -220,6 +233,10 @@ const trafficOption = computed(() => {
 const outcomesOption = computed(() => {
   const buckets = props.report.buckets
   const rateName = t('usage.successRate')
+  const rates = buckets.map((item) => {
+    const value = successRate(item)
+    return value === null ? null : Math.round(value * 1000) / 10
+  })
   const rate = (value: number) => percent(value / 100, 0)
   const bar = (name: string, color: string, data: number[]) => ({
     name,
@@ -279,10 +296,8 @@ const outcomesOption = computed(() => {
         showSymbol: false,
         connectNulls: false,
         color: '#60a5fa',
-        data: buckets.map((item) => {
-          const value = successRate(item)
-          return value === null ? null : Math.round(value * 1000) / 10
-        }),
+        data: rates,
+        markPoint: lonePoints(rates),
       },
     ],
   })
@@ -332,6 +347,7 @@ const latencyOption = computed(() => {
     connectNulls: false,
     color,
     data,
+    markPoint: lonePoints(data),
   })
   const options = base(axisDuration)
   return withLegend('latency', {
@@ -461,7 +477,7 @@ onUnmounted(() => {
     <figure class="min-w-0 rounded-lg border border-line bg-panel p-4 xl:col-span-2">
       <div class="mb-2 flex flex-wrap items-center gap-2">
         <figcaption class="mr-auto">
-          <span class="text-sm font-medium text-gray-200">{{ t('usage.chartTraffic') }}</span>
+          <span class="text-sm font-semibold text-gray-200">{{ t('usage.chartTraffic') }}</span>
           <span class="ml-2 text-xs text-gray-500">{{ t('usage.chartTrafficHelp') }}</span>
         </figcaption>
         <UiSelect
@@ -504,7 +520,7 @@ onUnmounted(() => {
       </div>
     </figure>
     <figure class="flex min-w-0 flex-col rounded-lg border border-line bg-panel p-4">
-      <figcaption class="mb-2 text-sm font-medium text-gray-200">
+      <figcaption class="mb-2 text-sm font-semibold text-gray-200">
         {{ t('usage.chartOutcomes') }}
       </figcaption>
       <ChartLegend
@@ -518,7 +534,7 @@ onUnmounted(() => {
       </div>
     </figure>
     <figure class="flex min-w-0 flex-col rounded-lg border border-line bg-panel p-4">
-      <figcaption class="mb-2 text-sm font-medium text-gray-200">
+      <figcaption class="mb-2 text-sm font-semibold text-gray-200">
         {{ t('usage.chartLatency') }}
       </figcaption>
       <table class="mb-3 w-full text-xs tabular-nums">
@@ -567,7 +583,7 @@ onUnmounted(() => {
       </div>
     </figure>
     <figure class="min-w-0 rounded-lg border border-line bg-panel p-4 xl:col-span-2">
-      <figcaption class="mb-2 text-sm font-medium text-gray-200">
+      <figcaption class="mb-2 text-sm font-semibold text-gray-200">
         {{ t('usage.chartTokens') }}
       </figcaption>
       <ChartLegend

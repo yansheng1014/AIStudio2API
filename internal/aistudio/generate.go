@@ -29,23 +29,23 @@ type tokenCountResult struct {
 	err   error
 }
 
-// EncodeGenerateContentRequest 编码 GenerateContent 数组
-func EncodeGenerateContentRequest(request GenerateRequest, defaults GenerationDefaults, runtime RequestContext) ([]byte, error) {
+// EncodeGenerateContentRequest 编码 GenerateContent 数组，返回正文与 WAA proof 字段（field 5）在正文中的起始字节
+func EncodeGenerateContentRequest(request GenerateRequest, defaults GenerationDefaults, runtime RequestContext) ([]byte, int, error) {
 	tools, explicitTools, err := encodeRequestedTools(request.Tools)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	contents, err := encodeContents(request.Contents)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if len(contents) == 0 {
-		return nil, fmt.Errorf("GenerateContent contents 不能为空")
+		return nil, 0, fmt.Errorf("GenerateContent contents 不能为空")
 	}
 	request.Config.MediaResolution = cmp.Or(request.Config.MediaResolution, partMediaResolution(request.Contents))
 	config, err := encodeGenerationConfig(request.Config, defaults)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if config[8] != nil && responseSchemaBeyondPlayground(request.Config, config[8].([]any)) {
 		config[7], config[8] = "application/json", nil
@@ -61,7 +61,11 @@ func EncodeGenerateContentRequest(request GenerateRequest, defaults GenerationDe
 	}
 	var retrieval []any
 	if len(tools) > 0 {
-		retrieval = encodeRetrievalConfig(request.Tools.ToolConfig.Retrieval, runtime.Timezone)
+		timezone := ""
+		if slices.ContainsFunc(tools, groundingTool) {
+			timezone = runtime.Timezone
+		}
+		retrieval = encodeRetrievalConfig(request.Tools.ToolConfig.Retrieval, timezone)
 	}
 	length := 11
 	if request.turnToken != "" {
@@ -78,7 +82,7 @@ func EncodeGenerateContentRequest(request GenerateRequest, defaults GenerationDe
 	wire[1] = contents
 	safety, err := resolveSafetySettings(request.SafetySettings, defaults.ImageRoute)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if len(safety) > 0 {
 		wire[2] = encodeSafetySettings(safety)
@@ -107,7 +111,13 @@ func EncodeGenerateContentRequest(request GenerateRequest, defaults GenerationDe
 	if request.continuationToken != "" {
 		wire[16] = request.continuationToken
 	}
-	return json.Marshal(wire)
+	return marshalWAAArray(wire, 5)
+}
+
+// groundingTool 判断编码后的工具是 Google 搜索或地图检索工具，账户时区只随这两类工具发送
+func groundingTool(tool any) bool {
+	fields, _ := tool.([]any)
+	return len(fields) > 3 && fields[3] != nil || len(fields) > 10 && fields[10] != nil
 }
 
 // encodeRetrievalConfig 编码 ToolConfig.retrieval_config：用户坐标、语言代码与时区，都未设置时为 nil
@@ -191,6 +201,8 @@ func resolveGenerationSettings(config GenerationConfig, defaults GenerationDefau
 		thinkingLevel = 2
 	case "high":
 		thinkingLevel = 3
+	case "xhigh", "extra_high", "max":
+		thinkingLevel = 5
 	case "minimal":
 		thinkingLevel = 4
 	case "none":
@@ -200,7 +212,7 @@ func resolveGenerationSettings(config GenerationConfig, defaults GenerationDefau
 			thinkingBudget = &zero
 		}
 	default:
-		return settings, fmt.Errorf("reasoning effort 必须是 none、minimal、low、medium、high、xhigh 或 max")
+		return settings, fmt.Errorf("reasoning effort 必须是 none、minimal、low、medium、high、xhigh、extra_high 或 max")
 	}
 	if hasReasoningEffort && defaults.ThinkingLevel {
 		thinkingLevel = closestSupportedThinkingLevel(thinkingLevel, defaults.ThinkingLevels)
@@ -316,7 +328,7 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 		wire[7] = config.ResponseMIMEType
 	}
 	if settings.responseSchema != nil {
-		wire[8] = playgroundSchema(settings.responseSchema)
+		wire[8] = playgroundSchema(settings.responseSchema, true, true)
 	}
 	if !defaults.ImageRoute {
 		wire[13] = int64(1)
@@ -330,7 +342,7 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 	if thinking := settings.thinking; thinking != nil {
 		value := []any{int64(1)}
 		if thinking.level != nil {
-			value = []any{int64(1), nil, nil, *thinking.level}
+			value = []any{int64(1), nil, nil, generateThinkingLevel(*thinking.level)}
 		}
 		if thinking.budget != nil {
 			if len(value) < 2 {
@@ -355,16 +367,21 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 	return wire, nil
 }
 
-var thinkingLevelsByEffort = []int64{4, 1, 2, 3}
+var thinkingLevelsByEffort = []int64{4, 1, 2, 3, 5}
 
-// normalizedReasoningEffort 把各协议的思考强度归一为 none、minimal、low、medium、high，xhigh 与 max 取 high，未设置时为空
+// generateThinkingLevel 返回 ListModels 思考档位在 GenerateContent 请求中的编号，官网 Extra High 在 ListModels 中为 5、在请求中为 6
+func generateThinkingLevel(level int64) int64 {
+	if level == 5 {
+		return 6
+	}
+	return level
+}
+
+// normalizedReasoningEffort 把各协议的思考强度归一为小写，未设置时为空
 func normalizedReasoningEffort(value string) string {
 	effort := strings.ToLower(strings.TrimSpace(value))
-	switch effort {
-	case "thinking_level_unspecified":
+	if effort == "thinking_level_unspecified" {
 		return ""
-	case "xhigh", "max":
-		return "high"
 	}
 	return effort
 }
@@ -380,12 +397,12 @@ func ApplyModelSuffix(model string, config GenerationConfig) (string, Generation
 	switch value {
 	case "auto", "-1":
 		config.ReasoningEffort, config.ThinkingBudget = "", nil
-	case "none", "minimal", "low", "medium", "high", "xhigh", "max":
+	case "none", "minimal", "low", "medium", "high", "xhigh", "extra_high", "max":
 		config.ReasoningEffort, config.ThinkingBudget = value, nil
 	default:
 		budget, err := strconv.ParseInt(value, 10, 64)
 		if err != nil || budget < 0 {
-			return model, config, fmt.Errorf("%w: 模型名后缀 (%s) 必须是 none、auto、minimal、low、medium、high、xhigh、max 或非负整数思考预算", ErrInvalidArgument, value)
+			return model, config, fmt.Errorf("%w: 模型名后缀 (%s) 必须是 none、auto、minimal、low、medium、high、xhigh、extra_high、max 或非负整数思考预算", ErrInvalidArgument, value)
 		}
 		config.ReasoningEffort, config.ThinkingBudget = "", &budget
 	}
@@ -752,7 +769,7 @@ func validateGenerateEntry(request GenerateRequest, entry modelEntry) error {
 	if err := validateTranscriptionConfig(request.Config.TranscriptionConfig, entry.model); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
-	if entry.defaults.InteractionStream || entry.defaults.InteractionTask {
+	if interactionRouting(entry.model, entry.defaults, ChannelPlayground).IsInteraction() {
 		return nil
 	}
 	if _, err := encodeGenerationConfig(applyModelMediaDefaults(request.Config, entry.model), entry.defaults); err != nil {
@@ -795,18 +812,39 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 		if err := validateAntiCensorInputs(request); err != nil {
 			return nil, err
 		}
-		// required 模式让 prepareToolRequest 把「必须调用该工具」写进系统指令，并在 contract 里声明；
-		// 包装器自己处理事件，因此随后丢弃 contract 的强制校验
 		request.Tools = antiCensorTools()
 		request.Tools.ToolConfig.Mode = "required"
 		request.Tools.ToolConfig.AllowedFunctionNames = []string{antiCensorToolName}
 	}
-	apiKey, _ := ctx.Value(apiKeyContextKey{}).(string)
-	restoring := request.restoreModelTurns && !build && !entry.model.Capabilities["assistant_route"] && !entry.defaults.InteractionStream && !entry.defaults.InteractionTask
-	if restoring {
-		request.Contents, request.turnToken = c.turns.restore(apiKey, request.Contents)
+	channel := ChannelPlayground
+	if build {
+		channel = ChannelBuild
 	}
-	history := request.Contents
+	route := interactionRouting(entry.model, entry.defaults, channel)
+	if antiCensor && (route.IsInteraction() || route.IsTask()) {
+		return nil, fmt.Errorf("%w: 该路由不支持 -uncut 包装", ErrInvalidArgument)
+	}
+	apiKey, _ := ctx.Value(apiKeyContextKey{}).(string)
+	assistant := entry.model.Capabilities["assistant_route"]
+	if chineseRewriteEligible(request, entry) {
+		request, err = applyChineseRewrite(request)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if thinkingGuardEligible(request, entry) {
+		request = applyThinkingGuard(request, entry)
+	}
+	restoring := request.restoreModelTurns && !build && !assistant && !route.IsAgent()
+	if restoring && c.turns != nil {
+		if !route.IsInteraction() {
+			var tip turnLink
+			request.Contents, request.turnToken, tip = c.turns.restore(apiKey, request.Contents)
+			request.turnChain = turnChain{contents: request.Contents, tip: tip}
+		} else {
+			request.turnChain = turnChain{contents: request.Contents, tip: turnChain{}.tipOf(request.Contents)}
+		}
+	}
 	if err := validateVideoParts(request.Contents); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
@@ -820,21 +858,29 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 			return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 		}
 	}
-	interaction := entry.defaults.InteractionStream && !build
-	task := entry.defaults.InteractionTask && !build
-	if interaction {
+	if route.IsStream() && entry.defaults.VideoOutput {
 		request.Tools = Tools{}
 	}
-	request, contract, err := prepareToolRequest(request)
+	useReplyTool := !antiCensor && !route.IsInteraction() && replyToolEligible(request, entry, build, assistant)
+	request, contract, err := prepareToolRequestWithReplyTool(request, true, useReplyTool)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
+	reportReplyToolActive(ctx, useReplyTool)
 	if antiCensor {
 		contract = nil
 		request, err = buildAntiCensorRequest(request)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 		}
+	}
+	if useReplyTool {
+		request = applyReplyTool(request)
+		if contract == nil {
+			contract = &toolContract{}
+		}
+		contract.replyTool = true
+		contract.stopSequences = request.Config.StopSequences
 	}
 	if err := validateTranscriptionConfig(request.Config.TranscriptionConfig, entry.model); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
@@ -845,25 +891,38 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 			return nil, err
 		}
 	}
-	if interaction {
-		return c.generateInteraction(ctx, request, entry)
+	if route.IsStream() {
+		events, err := c.generateInteraction(ctx, request, entry, route, apiKey, restoring)
+		if err != nil {
+			return nil, err
+		}
+		return contract.forward(ctx, events), nil
 	}
-	if task {
-		return c.generateInteractionTask(ctx, request, entry)
+	if route.IsTask() {
+		events, err := c.generateInteractionTask(ctx, request, entry, route, apiKey, restoring)
+		if err != nil {
+			return nil, err
+		}
+		return contract.forward(ctx, events), nil
 	}
 	request.Config = applyModelMediaDefaults(request.Config, entry.model)
 	request.ImageRoute = entry.defaults.ImageRoute
 	request.Contents = applySpeechTranscript(request.Contents, entry.model, request.Config)
 	wireRequest := request
 	wireRequest.Config.StopSequences = nil
+	// accountCtx 是发送请求所用的上下文，续写轮换账户后为新账户的上下文
+	accountCtx := ctx
+	switched := func(next context.Context, accountID string) {
+		accountCtx, request.AccountID, wireRequest.AccountID = next, accountID, accountID
+	}
 	sendRequest := func() (*RPCResponse, func(io.Reader, func(Event) error) error, error) {
 		switch {
-		case entry.model.Capabilities["assistant_route"]:
-			return c.sendAssistant(ctx, wireRequest, entry)
+		case assistant:
+			return c.sendAssistant(accountCtx, wireRequest, entry)
 		case build:
-			return c.sendBuild(ctx, wireRequest, entry)
+			return c.sendBuild(accountCtx, wireRequest, entry)
 		default:
-			return c.sendPlayground(ctx, wireRequest, entry)
+			return c.sendPlayground(accountCtx, wireRequest, entry, switched)
 		}
 	}
 	response, decodeStream, err := sendRequest()
@@ -888,11 +947,14 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 		stopClose := closeOnCancel(response)
 		defer func() { stopClose() }()
 		providerModel := entry.model.ID
+		// sentOutput 表示下游已收到本次生成的事件
+		sentOutput := false
 		send := func(event Event) error {
 			providerModel = cmp.Or(event.ProviderModel, providerModel)
 			event.ProviderModel = providerModel
 			select {
 			case events <- event:
+				sentOutput = true
 				return nil
 			case <-ctx.Done():
 				return ctx.Err()
@@ -905,16 +967,25 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 		var turn modelTurn
 		// committed 表示本次生成已有不能随重新生成丢弃的输出：客户端收到的正文、函数调用与媒体，或重新执行有外部副作用的服务端工具调用
 		committed := false
-		// sources 暂存 committed 之前收到的网页来源与引用，重新生成时丢弃
-		var sources []Event
-		releaseSources := func() error {
-			for _, source := range sources {
-				if err := send(source); err != nil {
+		// held 暂存 committed 之前收到的网页来源、引用与思考签名，非流式请求另暂存思考内容，重新生成时丢弃
+		var held []Event
+		releaseHeld := func() error {
+			for _, event := range held {
+				if err := send(event); err != nil {
 					return err
 				}
 			}
-			sources = nil
+			held = nil
 			return nil
+		}
+		// roundParts 记录当前上游回合收到的未合并 Part，用于回复工具在 more=true 提前收尾时自动构造续接轮
+		var roundParts []Part
+		var replyStopMatcher *stopSequenceMatcher
+		replyStopMatched := false
+		replyHasFinalText := false
+		replyLastEndedNewline := false
+		if useReplyTool && len(request.Config.StopSequences) > 0 {
+			replyStopMatcher = newStopSequenceMatcher(request.Config.StopSequences)
 		}
 		matchedStopSequence := ""
 		emitEvent := func(event Event) error {
@@ -936,18 +1007,36 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 				}
 				if !hiddenTool || !serverToolReplayable(event) {
 					output.Add(event)
-					if restoring && event.HasContent() {
-						turn.parts = append(turn.parts, clonePart(event.Part))
+					if event.HasContent() {
+						if restoring {
+							turn.parts = append(turn.parts, clonePart(event.Part))
+						}
+						if useReplyTool {
+							roundParts = append(roundParts, clonePart(event.Part))
+						}
+					}
+					if replyStopMatcher != nil && !replyStopMatched && event.Kind == EventToolCall && event.FunctionCall != nil && isReplyToolName(event.FunctionCall.Name) {
+						if text, _, ok := replyToolCallArgs(event.FunctionCall.Arguments); ok && text != "" {
+							chunk := text
+							if replyHasFinalText && !replyLastEndedNewline && !strings.HasPrefix(text, "\n") && !strings.HasPrefix(text, "\r") {
+								chunk = "\n\n" + text
+							}
+							replyHasFinalText = true
+							replyLastEndedNewline = strings.HasSuffix(text, "\n") || strings.HasSuffix(text, "\r")
+							if _, seq := replyStopMatcher.write(chunk); seq != "" {
+								replyStopMatched = true
+							}
+						}
 					}
 					committed = committed || !event.Thought && event.payload()
 				}
-				if !committed {
-					if event.Kind == EventGrounding || event.Kind == EventCitation {
-						sources = append(sources, event)
-						return nil
+				if committed {
+					if err := releaseHeld(); err != nil {
+						return err
 					}
-				} else if err := releaseSources(); err != nil {
-					return err
+				} else if event.Kind == EventGrounding || event.Kind == EventCitation {
+					held = append(held, event)
+					return nil
 				}
 				if request.Config.HideThinking && event.Kind == EventReasoning || hiddenTool {
 					if event.ThoughtSignature == "" {
@@ -958,19 +1047,42 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 						TurnToken: event.TurnToken, DebugInfo: event.DebugInfo, ResponseID: event.ResponseID, FrameUsage: event.FrameUsage, FinishFrame: event.FinishFrame,
 					}
 				}
+				if !committed && (event.Kind == EventThoughtSignature || request.Unary && event.Thought) {
+					held = append(held, event)
+					return nil
+				}
 				return send(event)
 			}
 		}
-		if antiCensor {
-			base := emitEvent
-			filter := &antiCensorFilter{model: request.Model, id: request.ID}
-			emitEvent = func(event Event) error { return filter.forward(event, base) }
+		// roundUsage 是本次尝试最近一帧的上游用量，流中断时没有用量事件
+		var roundUsage *Usage
+		roundEmit := func() func(Event) error {
+			if antiCensor {
+				base := emitEvent
+				filter := &antiCensorFilter{model: request.Model, id: request.ID}
+				emitEvent = func(event Event) error { return filter.forward(event, base) }
+			}
+			emit := stopSequenceEmitter(matcher, emitEvent, &matchedStopSequence)
+			return func(event Event) error {
+				roundUsage = cmp.Or(event.FrameUsage, roundUsage)
+				return emit(event)
+			}
 		}
-		emit := stopSequenceEmitter(matcher, emitEvent, &matchedStopSequence)
-		err := decodeStream(observeStreamActivity(ctx, response.Body), emit)
-		for regenerated := 0; regenerated < regenerations && regenerable(ctx, err, finish, committed); regenerated++ {
+		err := decodeStream(observeStreamActivity(ctx, response.Body), roundEmit())
+		// 写代码助手的调用块错误已在 trajectory 内重答，这里只重新生成发送与读取失败
+		for regenerated := 0; regenerated < regenerations && regenerable(ctx, err, finish, committed) && (err != nil || !assistant); regenerated++ {
+			if err != nil {
+				reportRegeneration(ctx, regenerated+1, err.Error())
+			} else {
+				reportRegeneration(ctx, regenerated+1, fmt.Sprintf("结束原因 %s", finish.FinishReason))
+			}
 			stopClose()
 			_ = response.Body.Close()
+			usage, finish, held, turn, roundUsage, output, roundParts = nil, nil, nil, modelTurn{}, nil, Output{}, nil
+			replyStopMatched, replyHasFinalText, replyLastEndedNewline = false, false, false
+			if useReplyTool && len(request.Config.StopSequences) > 0 {
+				replyStopMatcher = newStopSequenceMatcher(request.Config.StopSequences)
+			}
 			if response, decodeStream, err = sendRequest(); err != nil {
 				if ctx.Err() == nil {
 					_ = send(Event{Kind: EventError, Err: err})
@@ -978,21 +1090,77 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 				return
 			}
 			stopClose = closeOnCancel(response)
-			usage, finish, sources, turn = nil, nil, nil, modelTurn{}
 			matcher = newStopSequenceMatcher(request.Config.StopSequences)
-			emit = stopSequenceEmitter(matcher, emitEvent, &matchedStopSequence)
-			err = decodeStream(observeStreamActivity(ctx, response.Body), emit)
+			err = decodeStream(observeStreamActivity(ctx, response.Body), roundEmit())
 		}
-		if releaseSources() != nil {
-			return
+		// 模型在回复工具开启时若发出 final(more=true) 后即结束回合（期待工具返回），自动回传 functionResponse 续接剩余段落
+		replyContinued := false
+		for replyRound := 0; useReplyTool && !build && !assistant && replyRound < maxReplyToolContinuationRounds && ctx.Err() == nil && err == nil && finish != nil && finish.FinishReason == "stop" && !replyStopMatched; replyRound++ {
+			results, ok := replyToolContinuationResults(roundParts)
+			if !ok {
+				break
+			}
+			replyContinued = true
+			reportReplyToolContinuation(ctx)
+			stopClose()
+			_ = response.Body.Close()
+			prevUsage := cmp.Or(usage, roundUsage)
+			wireRequest.Contents = append(slices.Clip(wireRequest.Contents),
+				Content{Role: RoleAssistant, Parts: roundParts},
+				Content{Role: RoleUser, Parts: results},
+			)
+			wireRequest.continuationProof = ""
+			wireRequest.continuationToken = ""
+			wireRequest.continuationRound = 0
+			wireRequest.turnToken = ""
+			usage, finish, roundUsage, roundParts = nil, nil, nil, nil
+			response, decodeStream, err = sendRequest()
+			for err != nil && retryableAccountError(err) {
+				accounts, ok := accountCtx.Value(continuationAccountsKey{}).(ContinuationAccounts)
+				if !ok {
+					break
+				}
+				next, switchErr := accounts(accountCtx, err)
+				if switchErr != nil {
+					if !errors.Is(switchErr, ErrNoEligibleAccount) {
+						err = errors.Join(err, switchErr)
+					}
+					break
+				}
+				lease, _ := AccountLeaseFromContext(next)
+				switched(next, lease.Account().ID)
+				response, decodeStream, err = sendRequest()
+			}
+			if err != nil {
+				stopClose = func() bool { return false }
+				usage = prevUsage
+				break
+			}
+			stopClose = closeOnCancel(response)
+			err = decodeStream(observeStreamActivity(ctx, response.Body), roundEmit())
+			if prevUsage != nil {
+				if current := cmp.Or(usage, roundUsage); current != nil {
+					merged := mergeContinuedUsage(*prevUsage, *current)
+					usage = &merged
+				} else {
+					usage = prevUsage
+				}
+			}
 		}
 		if errors.Is(err, errStopSequenceMatched) {
-			_ = response.Body.Close()
+			if response != nil && response.Body != nil {
+				_ = response.Body.Close()
+			}
+			if releaseHeld() != nil {
+				return
+			}
 			finishAtStopSequence(ctx, request, output, stopTokenCount, matchedStopSequence, send)
 			return
 		}
-		if closeErr := response.Body.Close(); err == nil {
-			err = closeErr
+		if response != nil && response.Body != nil {
+			if closeErr := response.Body.Close(); err == nil {
+				err = closeErr
+			}
 		}
 		if ctx.Err() == nil && matcher != nil {
 			if pending := matcher.flush(); pending != "" {
@@ -1001,10 +1169,55 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 				}
 			}
 		}
-		if err != nil {
+		// feedback 是上游拦截帧，按输入本身拦截时保持输入拒绝，其余拦截作为内容策略错误由客户端重试
+		var feedback *PromptFeedbackError
+		if errors.As(err, &feedback) && !feedback.InputBlocked() {
+			err = &ContentPolicyError{Reason: feedback.Reason, Message: feedback.Message}
+			usage = cmp.Or(usage, feedback.Usage)
+		}
+		// trailing 是上游在首轮函数调用之后结束生成的错误，客户端已收到完整的函数调用，按正常完成结束；
+		// 回复工具自动续接轮中出错或遇内容策略时不吞错，交由下方流中错误路径写明原因结束。
+		var trailing error
+		switch {
+		case ctx.Err() != nil:
+		case err != nil && !replyContinued && calledFunction(output):
+			trailing, err = err, nil
+			finish = &Event{Kind: EventFinish, FinishReason: "stop"}
+			if usage == nil {
+				usage = roundUsage
+			}
+		case finish != nil && !replyContinued && contentPolicyFinish(finish.FinishReason) && calledFunction(output):
+			trailing = &ContentPolicyError{Reason: finish.FinishReason, Message: finish.FinishMessage}
+			finish.FinishReason, finish.FinishMessage = "stop", ""
+		}
+		var policy *ContentPolicyError
+		switch {
+		case errors.As(err, &policy):
+		case err != nil:
 			if ctx.Err() == nil {
 				_ = send(Event{Kind: EventError, Err: err})
 			}
+			return
+		case finish != nil && contentPolicyFinish(finish.FinishReason):
+			policy = &ContentPolicyError{Reason: finish.FinishReason, Message: finish.FinishMessage}
+		case finish != nil && abnormalGenerationFinish(finish.FinishReason) && len(output.Visible()) == 0 && (request.Config.HideThinking || len(output.Parts) == 0) && !request.KeepAbnormalFinish:
+			if ctx.Err() == nil {
+				_ = send(Event{Kind: EventError, Err: &AbnormalFinishError{Reason: finish.FinishReason, Message: finish.FinishMessage, Usage: usage}})
+			}
+			return
+		}
+		if policy != nil {
+			if !sentOutput {
+				policy.Usage = usage
+			} else if usage != nil && send(Event{Kind: EventUsage, Usage: usage}) != nil {
+				return
+			}
+			if ctx.Err() == nil {
+				_ = send(Event{Kind: EventError, Err: policy})
+			}
+			return
+		}
+		if releaseHeld() != nil {
 			return
 		}
 		if usage == nil {
@@ -1021,13 +1234,37 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 			return
 		}
 		if finish != nil {
+			finish.TrailingError = trailing
 			_ = send(*finish)
 		}
-		if restoring {
-			c.turns.store(apiKey, history, turn)
+		if restoring && trailing == nil && !(contract != nil && contract.replyTool && calledReplyTool(output)) {
+			c.turns.store(apiKey, request.turnChain.tip, turn)
 		}
 	}()
 	return contract.forward(ctx, events), nil
+}
+
+// calledFunction 表示本次生成已输出函数调用，上游的函数调用 Part 总是完整到达
+func calledFunction(output Output) bool {
+	return slices.ContainsFunc(output.Parts, func(part Part) bool { return part.FunctionCall != nil })
+}
+
+// contentPolicyFinish 表示结束原因属于内容策略类：安全、背诵、屏蔽词、禁止内容、个人敏感信息与对应的图片原因
+func contentPolicyFinish(reason string) bool {
+	switch reason {
+	case "safety", "recitation", "blocklist", "prohibited_content", "spii", "image_safety", "image_prohibited_content", "image_recitation":
+		return true
+	}
+	return false
+}
+
+// abnormalGenerationFinish 表示结束原因属于异常工具调用或格式错误响应：格式错误的函数调用、意外的工具调用与格式错误的响应
+func abnormalGenerationFinish(reason string) bool {
+	switch reason {
+	case "malformed_function_call", "unexpected_tool_call", "malformed_response":
+		return true
+	}
+	return false
 }
 
 // regenerable 表示上游以函数调用格式错误、意外的工具调用或响应格式异常结束、流在完成帧之前中断或流尾为 5xx 错误，且本次生成还没有不能丢弃的输出
@@ -1038,7 +1275,7 @@ func regenerable(ctx context.Context, err error, finish *Event, committed bool) 
 		if ctx.Err() != nil || !errors.As(err, &interrupted) && !(errors.As(err, &rpcError) && rpcError.StatusCode >= http.StatusInternalServerError) {
 			return false
 		}
-	} else if finish == nil || finish.FinishReason != "malformed_function_call" && finish.FinishReason != "unexpected_tool_call" && finish.FinishReason != "malformed_response" {
+	} else if finish == nil || !abnormalGenerationFinish(finish.FinishReason) {
 		return false
 	}
 	return !committed
@@ -1164,13 +1401,13 @@ func nextConversationTurn(contents []Content) int {
 	return -1
 }
 
-// sendPlayground 编码并发送 Playground GenerateContent，返回响应与含完成帧校验的流解码
-func (c *Client) sendPlayground(ctx context.Context, request GenerateRequest, entry modelEntry) (*RPCResponse, func(io.Reader, func(Event) error) error, error) {
+// sendPlayground 编码并发送 Playground GenerateContent，返回响应与含完成帧校验的流解码，续写轮换账户后以新账户的上下文与 ID 调用 switched
+func (c *Client) sendPlayground(ctx context.Context, request GenerateRequest, entry modelEntry, switched func(context.Context, string)) (*RPCResponse, func(io.Reader, func(Event) error) error, error) {
 	reason := ""
 	if request.Unary {
 		reason = "Playground GenerateContent 使用服务端流，收集完成后返回"
 	}
-	reportUpstreamMode(ctx, "GenerateContent", "stream", reason)
+	reportUpstreamMode(ctx, "GenerateContent", "stream", 0, reason)
 	runtime := RequestContext{}
 	if c.contextProvider != nil {
 		var err error
@@ -1179,21 +1416,33 @@ func (c *Client) sendPlayground(ctx context.Context, request GenerateRequest, en
 			return nil, nil, fmt.Errorf("读取 AI Studio 请求上下文: %w", err)
 		}
 	}
-	body, err := EncodeGenerateContentRequest(request, entry.defaults, runtime)
+	body, proofAt, err := EncodeGenerateContentRequest(request, entry.defaults, runtime)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
-	response, err := c.doProtected(ctx, request, body)
+	response, err := c.doProtected(ctx, request, body, proofAt)
 	if err != nil {
 		return nil, nil, err
 	}
+	request.continuationProof = response.Proof
 	return response, func(source io.Reader, emit func(Event) error) error {
-		return c.decodePlaygroundRounds(ctx, request, entry.defaults, runtime, source, restoreFunctionNames(request.Tools.Functions, emit))
+		return c.decodePlaygroundRounds(ctx, request, entry.defaults, runtime, source, restoreFunctionNames(request.Tools.Functions, emit), switched)
 	}, nil
 }
 
-// decodePlaygroundRounds 解码 GenerateContent 流，上游要求续写时携带续写 token 发送下一轮，各轮输出依次转发
-func (c *Client) decodePlaygroundRounds(ctx context.Context, request GenerateRequest, defaults GenerationDefaults, runtime RequestContext, source io.Reader, emit func(Event) error) error {
+// continuationAccountsKey 是上下文中续写轮换账户函数的键
+type continuationAccountsKey struct{}
+
+// ContinuationAccounts 在续写轮以可换账户的错误失败后返回改由其他账户发送该轮的上下文
+type ContinuationAccounts func(context.Context, error) (context.Context, error)
+
+// ContextWithContinuationAccounts 返回续写轮可经 accounts 换账户发送的上下文
+func ContextWithContinuationAccounts(ctx context.Context, accounts ContinuationAccounts) context.Context {
+	return context.WithValue(ctx, continuationAccountsKey{}, accounts)
+}
+
+// decodePlaygroundRounds 解码 GenerateContent 流，上游要求续写时携带续写 token 发送下一轮，续写轮以可换账户的错误失败时经上下文中的 ContinuationAccounts 换账户重发并调用 switched，没有其他账户时返回该轮的上游错误，各轮输出依次转发
+func (c *Client) decodePlaygroundRounds(ctx context.Context, request GenerateRequest, defaults GenerationDefaults, runtime RequestContext, source io.Reader, emit func(Event) error, switched func(context.Context, string)) error {
 	total := int64(0)
 	if defaults.ContinuedOutputTokens > 0 {
 		config, err := encodeGenerationConfig(request.Config, defaults)
@@ -1203,6 +1452,8 @@ func (c *Client) decodePlaygroundRounds(ctx context.Context, request GenerateReq
 		total, _ = config[3].(int64)
 	}
 	var previous *Usage
+	closeRound := func() {}
+	defer func() { closeRound() }()
 	for {
 		decoder := NewFrameDecoder()
 		decoder.continuable = defaults.ContinuedOutputTokens > 0
@@ -1242,21 +1493,51 @@ func (c *Client) decodePlaygroundRounds(ctx context.Context, request GenerateReq
 		}
 		request.continuationRound++
 		request.continuationToken = decoder.continuation
-		reportContinuationRound(ctx)
-		reportUpstreamMode(ctx, "GenerateContent", fmt.Sprintf("stream | 续写=%d", request.continuationRound), "")
-		body, err := EncodeGenerateContentRequest(request, defaults, runtime)
+		reportUpstreamMode(ctx, "GenerateContent", "stream", request.continuationRound, "")
+		body, proofAt, err := EncodeGenerateContentRequest(request, defaults, runtime)
 		if err != nil {
 			return err
 		}
-		response, err := c.doProtected(ctx, request, body)
+		closeRound()
+		response, err := c.doProtected(ctx, request, body, proofAt)
+		for err != nil && retryableAccountError(err) {
+			accounts, ok := ctx.Value(continuationAccountsKey{}).(ContinuationAccounts)
+			if !ok {
+				break
+			}
+			next, switchErr := accounts(ctx, err)
+			if switchErr != nil {
+				if !errors.Is(switchErr, ErrNoEligibleAccount) {
+					err = errors.Join(err, switchErr)
+				}
+				break
+			}
+			ctx = next
+			lease, _ := AccountLeaseFromContext(ctx)
+			request.AccountID, request.continuationProof = lease.Account().ID, ""
+			switched(ctx, request.AccountID)
+			if c.contextProvider != nil {
+				if runtime, err = c.contextProvider.RequestContext(ctx, request.AccountID); err != nil {
+					return fmt.Errorf("读取 AI Studio 请求上下文: %w", err)
+				}
+			}
+			if body, proofAt, err = EncodeGenerateContentRequest(request, defaults, runtime); err != nil {
+				return err
+			}
+			reportUpstreamMode(ctx, "GenerateContent", "stream", request.continuationRound, "")
+			response, err = c.doProtected(ctx, request, body, proofAt)
+		}
 		if err != nil {
 			return err
 		}
+		request.continuationProof = response.Proof
 		stopClose := context.AfterFunc(ctx, func() {
 			_ = response.Body.Close()
 		})
-		defer stopClose()
-		defer response.Body.Close()
+		closeRound = func() {
+			stopClose()
+			_ = response.Body.Close()
+		}
 		source = observeStreamActivity(ctx, response.Body)
 	}
 }
@@ -1282,7 +1563,7 @@ func mergeContinuedUsage(previous Usage, next Usage) Usage {
 // DecodeGenerateStream 按网络到达顺序解码 GenerateContent repeated 帧
 func DecodeGenerateStream(source io.Reader, decoder *FrameDecoder, emit func(Event) error) error {
 	return decodeGenerateItems(source, func(raw json.RawMessage) error {
-		events, err := decoder.Decode(raw)
+		events, err := decoder.decodeValid(raw)
 		if err != nil {
 			return err
 		}

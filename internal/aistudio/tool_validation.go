@@ -60,16 +60,14 @@ func supportedTools(tools Tools, model Model) (Tools, error) {
 	return tools, nil
 }
 
-// transcribeFunctionParts 把函数调用与函数结果 part 改写为文本转录，缺少名称的函数结果按待返回调用补齐名称
+// transcribeFunctionParts 把函数调用与函数结果 part 改写为文本转录，函数结果按 linkFunctionResults 的规则关联调用
 func transcribeFunctionParts(contents []Content) ([]Content, error) {
-	transcribed := cloneContentsForFileCopies(contents)
-	var pendingCalls []FunctionCall
+	transcribed, err := linkedContents(cloneContentsForFileCopies(contents))
+	if err != nil {
+		return nil, err
+	}
 	for contentIndex, content := range transcribed {
-		linked, err := linkFunctionResults(content, &pendingCalls)
-		if err != nil {
-			return nil, fmt.Errorf("contents[%d]: %w", contentIndex, err)
-		}
-		for partIndex, part := range linked.Parts {
+		for partIndex, part := range content.Parts {
 			if part.FunctionCall == nil && part.FunctionResult == nil {
 				continue
 			}
@@ -83,7 +81,7 @@ func transcribeFunctionParts(contents []Content) ([]Content, error) {
 	return transcribed, nil
 }
 
-// ToolPartTranscript 返回函数调用、函数结果与代码执行 part 的 Gemini API JSON 文本
+// ToolPartTranscript 返回函数调用、函数结果、代码执行与服务端工具步骤 part 的 Gemini API JSON 文本
 func ToolPartTranscript(part Part) (string, error) {
 	var value map[string]any
 	switch {
@@ -95,6 +93,10 @@ func ToolPartTranscript(part Part) (string, error) {
 		value = map[string]any{"executableCode": part.ExecutableCode}
 	case part.CodeExecutionResult != nil:
 		value = map[string]any{"codeExecutionResult": part.CodeExecutionResult}
+	case part.ToolCall != nil:
+		value = map[string]any{"toolCall": map[string]any{"id": part.ToolCall.ID, "toolType": part.ToolCall.Type, "args": transcriptJSON(part.ToolCall.Data)}}
+	case part.ToolResponse != nil:
+		value = map[string]any{"toolResponse": map[string]any{"id": part.ToolResponse.ID, "toolType": part.ToolResponse.Type, "response": transcriptJSON(part.ToolResponse.Data)}}
 	}
 	encoded, err := json.Marshal(value)
 	if err != nil {

@@ -1,9 +1,9 @@
-import { jsonBody } from '@/api'
 import { useConsole } from '@/console'
 import type { Model } from '@/types'
-import { Capability, hasCode, isAgent, toolCodes, type Tool } from './catalog'
+import { blobToBase64, hasCachedAttachmentBlob, loadAttachmentBlob } from './media-store'
+import { Capability, hasCode, isAgent, isOmniModel, toolCodes, type Tool } from './catalog'
 import type { Protocol } from './protocols'
-import type { Part, RunSettings, Source, Support, Turn } from './types'
+import type { AgentEnvironment, Part, RunSettings, Source, Support, Turn } from './types'
 
 // GenerateRequest 是一次 Gemini API 生成请求的正文
 export interface GenerateRequest {
@@ -33,22 +33,78 @@ function parseJSON(text: string): unknown {
   }
 }
 
-// requestContents 把对话轮次写为 contents：去掉思考正文、出错的空轮次与附件的显示字段
-function requestContents(turns: readonly Turn[]): GenerateRequest['contents'] {
+// requestContents 把对话轮次写为 contents：去掉思考正文、出错的空轮次与附件的显示字段，Omni 与官网一样不发送视频设置
+function requestContents(turns: readonly Turn[], omni: boolean): GenerateRequest['contents'] {
   return turns
     .map((turn) => ({
       role: turn.role,
       parts: turn.parts
         .filter((part) => !(part.thought && part.text !== undefined && !part.thoughtSignature))
-        .map(apiPart),
+        .map((part) => (omni ? omitVideoSettings(apiPart(part)) : apiPart(part))),
     }))
     .filter((turn) => turn.parts.length > 0)
 }
 
-// apiPart 返回去掉试用页显示字段的片段，内联附件的文件名写为 inlineData.displayName
-export function apiPart({ fileName, tokenCount: _tokenCount, ...part }: Part): Part {
-  if (fileName === undefined || part.inlineData === undefined) return part
-  return { ...part, inlineData: { ...part.inlineData, displayName: fileName } }
+// omitVideoSettings 返回去掉视频截取、帧率与处理方式的片段
+function omitVideoSettings({
+  videoMetadata: _metadata,
+  mediaProcessing: _mode,
+  ...part
+}: Part): Part {
+  return part
+}
+
+// apiPart 返回去掉试用页显示字段与 mediaId 的片段：已上传 Drive 的附件只发送文件引用，内联附件的文件名写为 inlineData.displayName
+export function apiPart({
+  fileName,
+  fileExpires: _fileExpires,
+  tokenCount: _tokenCount,
+  ...part
+}: Part): Part {
+  if (part.fileData !== undefined && part.inlineData !== undefined) {
+    const { inlineData: _preview, ...uploaded } = part
+    return uploaded
+  }
+  if (part.inlineData === undefined) return part
+  const { mediaId: _mediaId, ...inline } = part.inlineData
+  return {
+    ...part,
+    inlineData: fileName === undefined ? inline : { ...inline, displayName: fileName },
+  }
+}
+
+// needsInlineHydration 判断附件片段在发送请求前需要从本地 Blob 或对话媒体库补齐 Base64
+function needsInlineHydration(part: Part): boolean {
+  const inline = part.inlineData
+  return (
+    part.fileData === undefined &&
+    inline !== undefined &&
+    inline.data === '' &&
+    (inline.mediaId !== undefined || hasCachedAttachmentBlob(inline))
+  )
+}
+
+// hydratePart 按需为附件片段临时补齐 Base64 正文
+export async function hydratePart(part: Part, signal: AbortSignal | null = null): Promise<Part> {
+  if (!needsInlineHydration(part)) return part
+  const data = await blobToBase64(await loadAttachmentBlob(part, signal), signal)
+  return { ...part, inlineData: { ...part.inlineData!, data } }
+}
+
+// hydrateRequestTurns 为即将发出的对话轮次按需补齐非 Drive 附件的临时 Base64 正文
+export function hydrateRequestTurns(
+  turns: readonly Turn[],
+  signal: AbortSignal | null = null,
+): Promise<Turn[]> {
+  return Promise.all(
+    turns.map(async (turn) => {
+      if (!turn.parts.some(needsInlineHydration)) return turn
+      return {
+        ...turn,
+        parts: await Promise.all(turn.parts.map((part) => hydratePart(part, signal))),
+      }
+    }),
+  )
 }
 
 // buildRequest 按模型能力把运行设置写为 Gemini API 请求，模型不支持的设置不发送，采样参数按所设值发送
@@ -122,7 +178,10 @@ export function buildRequest(
     if (Array.isArray(declarations) && declarations.length > 0)
       tools.push({ functionDeclarations: declarations })
   }
-  const request: GenerateRequest = { contents: requestContents(turns), generationConfig: config }
+  const request: GenerateRequest = {
+    contents: requestContents(turns, isOmniModel(model)),
+    generationConfig: config,
+  }
   if (settings.systemInstruction.trim() !== '' && hasCode(model, Capability.SystemInstruction)) {
     request.systemInstruction = { parts: [{ text: settings.systemInstruction }] }
   }
@@ -139,8 +198,24 @@ export function buildRequest(
   return request
 }
 
+// agentFields 返回 agent 请求的 agent_config 与 environment 字段，都不需要时为 undefined
+export function agentFields(
+  settings: RunSettings,
+  model: Model | undefined,
+): Record<string, unknown> | undefined {
+  const config = agentConfig(settings, model)
+  const environment = hasCode(model, Capability.RemoteEnvironment)
+    ? agentEnvironment(settings.environment)
+    : undefined
+  if (config === undefined && environment === undefined) return undefined
+  return {
+    ...(config !== undefined && { agent_config: config }),
+    ...(environment !== undefined && { environment }),
+  }
+}
+
 // agentConfig 按官方 Interactions REST 写出 agent 的 agent_config：Antigravity 为所选模型与 token 上限，都未设置时不发送；Deep Research 按思考摘要、可视化与协作规划的能力码写出这三项；其余模型不发送
-export function agentConfig(
+function agentConfig(
   settings: RunSettings,
   model: Model | undefined,
 ): Record<string, unknown> | undefined {
@@ -165,6 +240,39 @@ export function agentConfig(
   return Object.keys(config).length > 0 ? { type: 'deep-research', ...config } : undefined
 }
 
+// agentEnvironment 按官方 Interactions REST 写出运行设置中的环境：已有环境与官网一样只发环境 ID，新环境带源或规则时为 remote 环境对象，没有规则时不发送 network，什么都没设置时不发送
+function agentEnvironment(
+  environment: AgentEnvironment,
+): string | Record<string, unknown> | undefined {
+  if (environment.type === 'existing') return environment.id.trim() || undefined
+  const sources = environment.sources
+  const allowlist = environment.rules
+    .filter((rule) => rule.domain.trim() !== '')
+    .map((rule) => {
+      const headers = rule.headers.filter((header) => header.name.trim() !== '')
+      return {
+        domain: rule.domain.trim(),
+        ...(headers.length > 0 && {
+          transform: Object.fromEntries(
+            headers.map((header) => [header.name.trim(), header.value]),
+          ),
+        }),
+      }
+    })
+  if (sources.length === 0 && allowlist.length === 0) return undefined
+  return {
+    type: 'remote',
+    ...(sources.length > 0 && {
+      sources: sources.map((source) =>
+        source.type === 'inline'
+          ? { type: 'inline', target: source.target, content: source.content }
+          : { type: source.type, source: source.source, target: source.target },
+      ),
+    }),
+    ...(allowlist.length > 0 && { network: { allowlist } }),
+  }
+}
+
 // continuation 与官网一样选取 Interactions 续接的起点：以 Interactions 发送且最后一个模型轮带交互 ID 时，以该 ID 续接并只发送其后的轮次，否则发送全部轮次
 export function continuation(
   protocol: Protocol,
@@ -175,14 +283,16 @@ export function continuation(
   return { previous, turns: previous === undefined ? turns : turns.slice(index + 1) }
 }
 
-// StreamUpdate 是一次流式事件带来的变化，interactionId 是 Interactions 完成时的交互 ID
+// StreamUpdate 是一次流式事件带来的变化，interactionId 与 environmentId 是 Interactions 完成时的交互 ID 与远程环境 ID
 export interface StreamUpdate {
   parts: Part[]
   interactionId?: string
+  environmentId?: string
   finishReason?: string
   tokens?: number
   thoughtTokens?: number
   promptTokens?: number
+  cachedTokens?: number
   sources?: Source[]
   supports?: Support[]
   searchQueries?: string[]
@@ -228,6 +338,7 @@ interface GeminiChunk {
   promptFeedback?: { blockReason?: string }
   usageMetadata?: {
     promptTokenCount?: number
+    cachedContentTokenCount?: number
     candidatesTokenCount?: number
     thoughtsTokenCount?: number
   }
@@ -246,6 +357,8 @@ export function streamUpdate(raw: unknown): StreamUpdate {
   }
   if (usage?.thoughtsTokenCount !== undefined) update.thoughtTokens = usage.thoughtsTokenCount
   if (usage?.promptTokenCount !== undefined) update.promptTokens = usage.promptTokenCount
+  if (usage?.cachedContentTokenCount !== undefined)
+    update.cachedTokens = usage.cachedContentTokenCount
   const grounding = candidate?.groundingMetadata
   if (grounding?.groundingChunks) {
     update.sources = grounding.groundingChunks
@@ -285,24 +398,63 @@ export function appendParts(parts: Part[], incoming: readonly Part[]): void {
   }
 }
 
-// countTokens 调用本服务 countTokens 计算当前对话的输入 token
-export async function countTokens(
+// TokenCountResult 是 countTokens 返回的总 token 数、系统指令 token 数与各轮次 token 数
+export interface TokenCountResult {
+  totalTokens: number
+  systemTokens?: number
+  contentTokens?: number[]
+}
+
+interface RawTokenPart {
+  partTokens?: number[]
+  roleTokens?: number
+}
+
+// sumTokenPart 汇总系统指令或单个轮次的各 Part 与角色 token 数
+function sumTokenPart(item: RawTokenPart | undefined): number | undefined {
+  if (!item || (item.partTokens === undefined && item.roleTokens === undefined)) return undefined
+  return (item.partTokens ?? []).reduce((sum, count) => sum + count, 0) + (item.roleTokens ?? 0)
+}
+
+// countTokensDetailed 调用本服务 countTokens 返回总输入 token、系统指令 token 与各轮次 token 明细
+export async function countTokensDetailed(
   modelID: string,
   apiKey: string,
   request: GenerateRequest,
   signal: AbortSignal,
-): Promise<number> {
+): Promise<TokenCountResult> {
   const headers = new Headers({ 'Content-Type': 'application/json' })
   if (apiKey !== '') headers.set('x-goog-api-key', apiKey)
   const response = await fetch(`/v1beta/models/${encodeURIComponent(modelID)}:countTokens`, {
     method: 'POST',
     headers,
     signal,
-    body: jsonBody({
+    body: JSON.stringify({
       generateContentRequest: { model: `models/${modelID}`, ...request },
     }),
   })
   if (!response.ok) throw new Error(await errorMessage(response))
-  const value = (await response.json()) as { totalTokens?: number }
-  return value.totalTokens ?? 0
+  const value = (await response.json()) as {
+    totalTokens?: number
+    systemInstructionsTokens?: RawTokenPart
+    contentTokens?: RawTokenPart[]
+  }
+  const systemTokens = sumTokenPart(value.systemInstructionsTokens)
+  const contentTokens = value.contentTokens?.map((item) => sumTokenPart(item) ?? 0)
+  return {
+    totalTokens: value.totalTokens ?? 0,
+    ...(systemTokens !== undefined && { systemTokens }),
+    ...(contentTokens !== undefined && { contentTokens }),
+  }
+}
+
+// countTokens 调用本服务 countTokens 计算当前对话或单个附件的输入 token
+export async function countTokens(
+  modelID: string,
+  apiKey: string,
+  request: GenerateRequest,
+  signal: AbortSignal,
+): Promise<number> {
+  const result = await countTokensDetailed(modelID, apiKey, request, signal)
+  return result.totalTokens
 }

@@ -92,13 +92,13 @@ func runCommand(args []string, logs *logOutput, executable string) (restart bool
 		cancel()
 		<-stopped
 	}
-	shell := newShell(options.openUI, stopService)
+	shell := newShell(options.openUI, cfg.HideDockIcon, stopService)
 	ready := make(chan serviceReady, 1)
 	shellCtx, stopShell := context.WithCancel(ctx)
 	defer stopShell()
 	var restarting atomic.Bool
 	go func() {
-		started, err := runService(ctx, cancel, cfg, options, logs, executable, &restarting, ready)
+		started, err := runService(ctx, cancel, cfg, options, logs, executable, &restarting, ready, shell.pickPath())
 		serviceErr = err
 		close(stopped)
 		if started {
@@ -123,12 +123,12 @@ func runCommand(args []string, logs *logOutput, executable string) (restart bool
 // serviceReady 为管理服务的启动结果：管理页面地址与服务日志，或启动失败的原因
 type serviceReady struct {
 	url string
-	log func(level, message string)
+	log func(level, message string, attrs ...any)
 	err error
 }
 
 // runService 装配运行时、打开请求账本并运行管理监听；就绪或启动失败时向 ready 发送一次结果，started 表示服务曾经就绪
-func runService(ctx context.Context, cancel func(), cfg config.Config, options commandOptions, logs *logOutput, executable string, restarting *atomic.Bool, ready chan<- serviceReady) (started bool, err error) {
+func runService(ctx context.Context, cancel func(), cfg config.Config, options commandOptions, logs *logOutput, executable string, restarting *atomic.Bool, ready chan<- serviceReady, pickPath func(start string) (string, error)) (started bool, err error) {
 	defer func() {
 		if !started && err != nil {
 			ready <- serviceReady{err: err}
@@ -138,8 +138,9 @@ func runService(ctx context.Context, cancel func(), cfg config.Config, options c
 	if err != nil {
 		return false, err
 	}
-	logService := func(level, message string) {
-		manager.requests.log("service", level, message)
+	defer manager.requests.close()
+	logService := func(level, message string, attrs ...any) {
+		manager.requests.log("service", level, message, attrs...)
 	}
 	ledger, err := requestdb.Open(filepath.Join("runtime", "requests.db"), logService)
 	if err != nil {
@@ -147,9 +148,7 @@ func runService(ctx context.Context, cancel func(), cfg config.Config, options c
 	}
 	ledger.SetBodyCapture(cfg.RequestBodyLog)
 	manager.ledger = ledger
-	if err := manager.seedFirstEvents(ctx); err != nil {
-		logService("WARN", "读取近期首事件样本失败 | 错误="+err.Error())
-	}
+	manager.seedAccountUsage(ctx, manager.current)
 	prompts, err := promptdb.Open(filepath.Join("runtime", "prompts.db"))
 	if err != nil {
 		return false, errors.Join(fmt.Errorf("打开对话库: %w", err), manager.Close(), ledger.Close())
@@ -161,14 +160,33 @@ func runService(ctx context.Context, cancel func(), cfg config.Config, options c
 	}
 	manager.states = states
 	manager.logs = logs
-	updater := newSelfUpdater(buildVersion(), executable, manager.egressProxy, logService, updateRestart(cancel, restarting, logService))
+	updater := newSelfUpdater(buildVersion(), executable, manager.egressProxy, manager.requests, updateRestart(cancel, restarting, logService))
+	if err := removeReplacedExecutables(executable); err != nil {
+		logService("WARN", "删除在线更新留下的旧版本失败", "error", err)
+	}
+	manager.pickPath = pickPath
 	started, err = runServer(ctx, cfg, manager, updater, func(address string) {
 		ready <- serviceReady{url: address, log: logService}
+		go func() {
+			if err := manager.seedFirstEvents(ctx); err != nil && ctx.Err() == nil {
+				logService("WARN", "读取近期首事件样本失败", "error", err)
+			}
+		}()
+		go reclaimFreePages(ctx, logService, prompts, states)
 	})
 	if started {
 		cancel()
 	}
 	return started, errors.Join(err, manager.Close(), ledger.Close(), prompts.Close(), states.Close())
+}
+
+// reclaimFreePages 在服务就绪后把各本地库的空闲页交还文件系统
+func reclaimFreePages(ctx context.Context, log func(level, message string, attrs ...any), stores ...interface{ Reclaim(context.Context) error }) {
+	for _, store := range stores {
+		if err := store.Reclaim(ctx); err != nil && ctx.Err() == nil {
+			log("WARN", "交还本地库空闲页失败", "error", err)
+		}
+	}
 }
 
 // parseFlags 使用命令行参数覆盖本次启动配置
@@ -217,20 +235,23 @@ const mediaLimit = 1 << 30
 
 // runServer 管理 HTTP 监听，就绪后以管理页面地址调用 onReady，运行到 ctx 结束或监听出错；started 表示监听曾经就绪
 func runServer(ctx context.Context, cfg config.Config, manager *runtimeManager, updater api.UpdateService, onReady func(address string)) (started bool, err error) {
-	manager.requests.log("service", "INFO", fmt.Sprintf("管理监听启动 | 地址=%s", cfg.ListenAddr))
+	startedAt := time.Now()
+	stage := api.LogStage{Name: "管理服务启动", Step: 1, Steps: 2}
+	manager.requests.logStage("service", "INFO", stage, "管理监听启动", "addr", cfg.ListenAddr)
 	listener, err := net.Listen("tcp", cfg.ListenAddr)
 	if errors.Is(err, portReserved) {
 		var address string
 		listener, address, err = listenAfter(cfg.ListenAddr)
 		if err == nil {
 			manager.reservedListenAddr, manager.activeManagement.ListenAddr = cfg.ListenAddr, address
-			manager.requests.log("service", "WARN", fmt.Sprintf("监听端口被 Windows 保留，改用其后第一个可用端口 | 配置=%s | 地址=%s", cfg.ListenAddr, address))
+			manager.requests.logStage("service", "WARN", api.LogStage{Name: stage.Name}, "监听端口被 Windows 保留，改用其后第一个可用端口", "configured_addr", cfg.ListenAddr, "addr", address)
 		}
 	}
 	if err != nil {
 		return false, fmt.Errorf("监听 %s: %w", cfg.ListenAddr, err)
 	}
-	manager.requests.log("service", "INFO", fmt.Sprintf("预览监听启动 | 地址=%s", cfg.PreviewListenAddr))
+	stage.Step = 2
+	manager.requests.logStage("service", "INFO", stage, "预览监听启动", "addr", cfg.PreviewListenAddr)
 	previewListener, err := net.Listen("tcp", cfg.PreviewListenAddr)
 	if err != nil {
 		host, _, _ := net.SplitHostPort(cfg.PreviewListenAddr)
@@ -239,16 +260,18 @@ func runServer(ctx context.Context, cfg config.Config, manager *runtimeManager, 
 			listener.Close()
 			return false, fmt.Errorf("监听 %s: %w", cfg.PreviewListenAddr, err)
 		}
-		manager.requests.log("service", "WARN", fmt.Sprintf("预览端口不可用，改用空闲端口 | 配置=%s | 地址=%s", cfg.PreviewListenAddr, previewListener.Addr()))
+		manager.requests.logStage("service", "WARN", api.LogStage{Name: stage.Name}, "预览端口不可用，改用空闲端口", "configured_addr", cfg.PreviewListenAddr, "addr", previewListener.Addr())
 	}
 	manager.previewAddress = previewListener.Addr().String()
+	manager.settings.Store(requestSettingsOf(manager.currentConfig()))
 	apiHandler := api.NewHandler(manager, api.Config{
-		APIKey: cfg.ProxyAPIKey, Admin: manager, Ledger: manager.ledger, Prompts: manager.prompts, Updates: updater,
+		APIKey: cfg.ProxyAPIKey, APIKeys: manager.currentAPIKey, Admin: manager, Ledger: manager.ledger, Prompts: manager.prompts, Updates: updater,
 		AdminAuthEnabled: cfg.AdminAuthEnabled, AdminUsername: cfg.AdminUsername, AdminPassword: cfg.AdminPassword,
 		AdminSessionPath: filepath.Join("runtime", "admin-sessions.json"),
 		MediaDir:         filepath.Join("runtime", "media"), MediaLimit: mediaLimit, MediaLinks: manager.mediaLinks,
 		ResponseModes: manager.responseModes, WaitLaunch: manager.WaitLaunch,
 		SearchSettings: manager.searchSettings, EgressProxy: manager.egressProxy, States: manager.states,
+		PickPath: manager.pickPath,
 	})
 	server := &http.Server{
 		Handler:           rootHandler(apiHandler),
@@ -269,7 +292,7 @@ func runServer(ctx context.Context, cfg config.Config, manager *runtimeManager, 
 	}()
 
 	address := "http://" + browserAddress(listener.Addr().String())
-	manager.requests.log("service", "INFO", "管理服务就绪 | 地址="+address)
+	manager.requests.logStage("service", "INFO", api.LogStage{Name: stage.Name, State: "completed"}, "管理服务就绪", "addr", address, "duration", time.Since(startedAt))
 	onReady(address)
 	if cfg.AutoStart {
 		go autoStartService(ctx, manager)
@@ -334,10 +357,10 @@ func autoStartService(ctx context.Context, manager *runtimeManager) {
 		}
 		var operation *adminOperationError
 		if errors.As(err, &operation) {
-			manager.requests.log("service", "ERROR", "自动启动生成服务失败 | 错误="+err.Error())
+			manager.requests.log("service", "ERROR", "自动启动生成服务失败", "error", err)
 			return
 		}
-		manager.requests.log("service", "ERROR", fmt.Sprintf("自动启动生成服务失败 | 重试间隔=%s | 错误=%s", delay, err))
+		manager.requests.log("service", "ERROR", "自动启动生成服务失败", "retry_in", delay, "error", err)
 		select {
 		case <-ctx.Done():
 			return
@@ -359,13 +382,20 @@ func rootHandler(apiHandler http.Handler) http.Handler {
 	return securityHeaders(root)
 }
 
-// compressAdmin 以 gzip 压缩管理接口发给接受 gzip 的客户端的 JSON、CSV 与事件流响应
+// compressAdmin 以 gzip 压缩管理接口发给接受 gzip 的客户端的 JSON、CSV 与事件流响应，媒体流原样输出以支持 Range
 func compressAdmin(next http.Handler) http.Handler {
 	wrap, err := gzhttp.NewWrapper(gzhttp.ContentTypes([]string{"application/json", "text/csv", "text/event-stream"}))
 	if err != nil {
 		panic(err)
 	}
-	return wrap(next)
+	compressed := wrap(next)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/prompts/media/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		compressed.ServeHTTP(w, r)
+	})
 }
 
 // securityHeaders 禁止页面被其他站点嵌入并关闭 MIME 嗅探与 Referer
