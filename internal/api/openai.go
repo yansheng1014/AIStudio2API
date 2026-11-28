@@ -184,7 +184,7 @@ func (s *server) publicModels(w http.ResponseWriter, r *http.Request) ([]aistudi
 		}
 		return nil, false
 	}
-	return s.searchModels(models), true
+	return s.uncutModels(s.searchModels(models)), true
 }
 
 func (s *server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {

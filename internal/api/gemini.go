@@ -326,7 +326,7 @@ func (s *server) handleGeminiModels(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	models = s.searchModels(models)
+	models = s.uncutModels(s.searchModels(models))
 	page, next, err := geminiPage(r.URL.Query(), models, 50, 1000)
 	if err != nil {
 		writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
@@ -383,7 +383,7 @@ func (s *server) handleGeminiModel(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if model, ok := LookupPublicModel(s.searchModels(models), modelID); ok {
+	if model, ok := LookupPublicModel(s.uncutModels(s.searchModels(models)), modelID); ok {
 		writeJSON(w, http.StatusOK, officialOrder("gemini", geminiModelObject(model)))
 		return
 	}
